@@ -249,13 +249,11 @@ def mode_events(replay_dir: str, output_dir: str):
 
 def mode_packets(filepath: str, max_frames: int = 10):
     """
-    Decompress frames, analyze per-frame structure, and attempt
-    inner packet parsing with multiple format heuristics.
+    Decompress frames, parse 15B headers + inner packets, full analysis.
     """
     from ml.parsers.chunk_parser import (
         parse_payload_frames,
-        print_frame_analysis,
-        print_inner_packet_attempt,
+        print_full_analysis,
     )
 
     p = ROFLParser(filepath)
@@ -272,7 +270,7 @@ def mode_packets(filepath: str, max_frames: int = 10):
     print(f"Expected:    {n_chunks} chunks + {n_keyframes} keyframes = {n_chunks + n_keyframes} frames")
     print(f"{'='*70}")
 
-    # Decompress all zstd frames
+    # Decompress
     print(f"\nDecompressing payload frames...")
     try:
         frames = p.decompress_payload_frames()
@@ -280,21 +278,17 @@ def mode_packets(filepath: str, max_frames: int = 10):
         print(f"  FAILED: {e}")
         return
 
-    total_decompressed = sum(len(f) for f in frames)
-    print(f"  Got {len(frames)} zstd frames, {total_decompressed:,} bytes total")
+    print(f"  Got {len(frames)} zstd frames, {sum(len(f) for f in frames):,} bytes")
 
     if not frames:
-        print("  No frames to parse!")
+        print("  No frames!")
         return
 
-    # Parse each frame individually
-    result = parse_payload_frames(frames)
+    # Parse all frames (15B header + inner packets)
+    result = parse_payload_frames(frames, parse_packets=True)
 
     # Full analysis
-    print_frame_analysis(result, n_chunks, n_keyframes)
-
-    # Try inner packet formats
-    print_inner_packet_attempt(result, max_frames=3)
+    print_full_analysis(result, n_chunks, n_keyframes)
 
 
 # ── main ───────────────────────────────────────────────────────────────
