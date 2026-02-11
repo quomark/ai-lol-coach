@@ -249,13 +249,13 @@ def mode_events(replay_dir: str, output_dir: str):
 
 def mode_packets(filepath: str, max_frames: int = 10):
     """
-    Decompress frames, concatenate into one stream, and parse
-    chunk/keyframe entries from the payload.
+    Decompress frames, analyze per-frame structure, and attempt
+    inner packet parsing with multiple format heuristics.
     """
     from ml.parsers.chunk_parser import (
-        parse_payload_stream,
-        print_payload_summary,
-        try_inner_packet_parse,
+        parse_payload_frames,
+        print_frame_analysis,
+        print_inner_packet_attempt,
     )
 
     p = ROFLParser(filepath)
@@ -287,15 +287,14 @@ def mode_packets(filepath: str, max_frames: int = 10):
         print("  No frames to parse!")
         return
 
-    # Parse the concatenated stream
-    print(f"\nConcatenating and parsing payload stream...")
-    result = parse_payload_stream(frames)
+    # Parse each frame individually
+    result = parse_payload_frames(frames)
 
-    # Print full summary
-    print_payload_summary(result)
+    # Full analysis
+    print_frame_analysis(result, n_chunks, n_keyframes)
 
-    # Try inner packet parsing on first few chunks
-    try_inner_packet_parse(result, max_entries=3)
+    # Try inner packet formats
+    print_inner_packet_attempt(result, max_frames=3)
 
 
 # ── main ───────────────────────────────────────────────────────────────
