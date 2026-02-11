@@ -19,7 +19,9 @@ import json
 import os
 import platform
 import re
+import subprocess
 import ssl
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -210,20 +212,126 @@ class LCUClient:
     # ── Launch replay ─────────────────────────────────────────────────
 
     def launch_replay(self, game_id: str | int) -> bool:
-        """Tell the client to download and launch a replay by game ID."""
-        result = self._post(f"/lol-replays/v1/rofls/{game_id}/watch")
-        return result is not None
+        """Tell the client to download and watch a replay by game ID."""
+        # Try multiple endpoints — varies by client version
+        endpoints = [
+            f"/lol-replays/v1/rofls/{game_id}/watch",
+            f"/lol-replays/v2/rofls/{game_id}/watch",
+        ]
+        for ep in endpoints:
+            result = self._post(ep)
+            if result is not None:
+                return True
+        return False
 
     def launch_replay_from_file(self, rofl_path: str) -> bool:
-        """Launch a local .rofl file."""
-        # The LCU can launch local files via the replay-ux endpoint
-        result = self._post("/lol-replays/v2/replay/watch", {"filePath": str(rofl_path)})
-        if result is None:
-            # Fallback: try v1
-            result = self._post("/lol-replays/v1/replay/watch", {"filePath": str(rofl_path)})
-        return result is not None
+        """
+        Launch a local .rofl file.
 
-    def get_replay_status(self) -> str | None:
+        Strategy 1: Extract game ID, use LCU watch endpoint
+        Strategy 2: Launch game executable directly with .rofl as argument
+        Strategy 3: Use /lol-replays/v1/rofls/{id}/watch/download then watch
+        """
+        from pathlib import Path
+        import subprocess
+        import re
+
+        rofl = Path(rofl_path)
+        if not rofl.exists():
+            print(f"  [ERROR] File not found: {rofl_path}")
+            return False
+
+        # Extract game ID from filename (e.g., "NA1_5480593641.replay.rofl" → "NA1_5480593641")
+        # or "TW2-388023029.rofl" → "TW2_388023029"
+        stem = rofl.stem.replace(".replay", "")
+        # Normalize: TW2-388023029 → TW2_388023029
+        game_id = stem.replace("-", "_")
+        game_id_dash = stem  # Keep original for some endpoints
+
+        print(f"  [INFO] Game ID: {game_id} | File: {rofl.name}")
+
+        # Strategy 1: Try LCU download + watch endpoint with game ID
+        for gid in (game_id_dash, game_id, stem):
+            # First try to "create" the replay entry by POSTing the path
+            self._post(f"/lol-replays/v1/rofls/{gid}/download", {
+                "gameId": gid,
+                "filePath": str(rofl.resolve()),
+            })
+            # Then watch it
+            result = self._post(f"/lol-replays/v1/rofls/{gid}/watch")
+            if result is not None:
+                print(f"  [OK] Launched via LCU watch endpoint")
+                return True
+
+        # Strategy 2: POST with componentType replay
+        result = self._post("/riotclient/launch-ux", {
+            "args": [str(rofl.resolve())],
+        })
+        if result is not None:
+            print(f"  [OK] Launched via riotclient/launch-ux")
+            return True
+
+        # Strategy 3: Find game executable and launch directly
+        game_exe = self._find_game_exe()
+        if game_exe:
+            try:
+                abs_path = str(rofl.resolve())
+                print(f"  [INFO] Launching directly: {game_exe} \"{abs_path}\"")
+                subprocess.Popen(
+                    [str(game_exe), abs_path],
+                    cwd=str(game_exe.parent),
+                )
+                print(f"  [OK] Launched game process directly")
+                return True
+            except Exception as e:
+                print(f"  [WARN] Direct launch failed: {e}")
+
+        # Strategy 4: Open file with OS default handler (double-click equivalent)
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(rofl.resolve()))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(rofl.resolve())])
+            else:
+                subprocess.Popen(["xdg-open", str(rofl.resolve())])
+            print(f"  [OK] Launched via OS file handler (double-click)")
+            return True
+        except Exception as e:
+            print(f"  [WARN] OS handler failed: {e}")
+
+        print(f"  [FAIL] All launch strategies failed")
+        return False
+
+    def _find_game_exe(self) -> Path | None:
+        """Find the League of Legends game executable."""
+        from pathlib import Path
+        candidates = [
+            Path("C:/Riot Games/League of Legends/Game/League of Legends.exe"),
+            Path("D:/Riot Games/League of Legends/Game/League of Legends.exe"),
+            Path(os.path.expanduser("~/Riot Games/League of Legends/Game/League of Legends.exe")),
+        ]
+        # Also try to get install path from LCU
+        install_dir = self._get("/lol-patch/v1/game-path")
+        if install_dir and isinstance(install_dir, str):
+            candidates.insert(0, Path(install_dir) / "League of Legends.exe")
+
+        for p in candidates:
+            if p.exists():
+                return p
+        return None
+
+    def get_replay_dir(self) -> str | None:
+        """Get the client's replay directory."""
+        data = self._get("/lol-replays/v1/configuration")
+        if data and isinstance(data, dict):
+            return data.get("replaysPath")
+        # Fallback
+        data = self._get("/lol-game-data/assets/v1/default-configuration")
+        if data and isinstance(data, dict):
+            return data.get("ReplayConfig", {}).get("ReplayFolderPath")
+        return None
+
+    def get_replay_status(self) -> Any:
         """Get replay download/launch status."""
         data = self._get("/lol-replays/v1/rofls")
         return data

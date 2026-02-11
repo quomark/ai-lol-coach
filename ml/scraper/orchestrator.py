@@ -315,11 +315,15 @@ def main():
     ap.add_argument("--no-memory", action="store_true",
                     help="Disable memory reader (API-only mode)")
 
-    # Quick test mode
+    # Quick test modes
     ap.add_argument("--test-lcu", action="store_true",
                     help="Just test LCU connection and exit")
     ap.add_argument("--test-api", action="store_true",
                     help="Test Live Client Data API and exit")
+    ap.add_argument("--test-launch", type=str, default=None, metavar="ROFL_PATH",
+                    help="Test launching a single .rofl file and exit")
+    ap.add_argument("--test-endpoints", action="store_true",
+                    help="Dump available LCU replay endpoints")
 
     args = ap.parse_args()
 
@@ -329,6 +333,45 @@ def main():
             print("[OK] LCU connected!")
             state = lcu.get_replay_state()
             print(f"Replay state: {json.dumps(state, indent=2) if state else 'No active replay'}")
+
+            # Also show replay dir
+            replay_dir = lcu.get_replay_dir()
+            print(f"Replay dir: {replay_dir}")
+
+            # Show available replays
+            status = lcu.get_replay_status()
+            if status:
+                print(f"Replay status: {json.dumps(status, indent=2)[:1000]}")
+        except FileNotFoundError as e:
+            print(f"[FAIL] {e}")
+        return
+
+    if args.test_endpoints:
+        try:
+            lcu = LCUClient()
+            print("[OK] LCU connected! Probing replay endpoints...\n")
+
+            endpoints = [
+                ("GET", "/lol-replays/v1/configuration"),
+                ("GET", "/lol-replays/v1/rofls"),
+                ("GET", "/lol-replays/v2/metadata"),
+                ("GET", "/replay/playback"),
+                ("GET", "/riotclient/region-locale"),
+                ("GET", "/lol-patch/v1/game-path"),
+                ("GET", "/lol-gameflow/v1/session"),
+            ]
+            for method, ep in endpoints:
+                try:
+                    if method == "GET":
+                        data = lcu._get(ep)
+                    else:
+                        data = lcu._post(ep)
+                    status = "OK" if data is not None else "null/404"
+                    preview = json.dumps(data, indent=2)[:300] if data else "null"
+                    print(f"  {method} {ep}: [{status}]")
+                    print(f"    {preview}\n")
+                except Exception as e:
+                    print(f"  {method} {ep}: ERROR {e}\n")
         except FileNotFoundError as e:
             print(f"[FAIL] {e}")
         return
@@ -341,6 +384,33 @@ def main():
                 print(f"[OK] Game data: {json.dumps(data, indent=2)[:2000]}")
             else:
                 print("[FAIL] No game data — is a replay running?")
+        except FileNotFoundError as e:
+            print(f"[FAIL] {e}")
+        return
+
+    if args.test_launch:
+        try:
+            lcu = LCUClient()
+            from pathlib import Path
+            rofl = Path(args.test_launch)
+            if not rofl.exists():
+                print(f"[FAIL] File not found: {rofl}")
+                return
+            print(f"Attempting to launch: {rofl}")
+            ok = lcu.launch_replay_from_file(str(rofl))
+            if ok:
+                print("\n[OK] Launch command sent. Waiting for replay to load...")
+                if lcu.wait_for_replay_loaded(timeout=90):
+                    print("[OK] Replay is playing!")
+                    data = lcu.get_game_data()
+                    if data:
+                        print(f"[OK] Live Client Data API working ({len(json.dumps(data))} bytes)")
+                    else:
+                        print("[INFO] Live Client Data API not responding yet")
+                else:
+                    print("[WARN] Replay didn't start within 90s")
+            else:
+                print("[FAIL] All launch strategies failed")
         except FileNotFoundError as e:
             print(f"[FAIL] {e}")
         return
