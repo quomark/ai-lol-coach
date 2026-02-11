@@ -200,7 +200,7 @@ def parse_payload_stream(frames: list[bytes]) -> PayloadParseResult:
         remaining = total_size - pos
 
         if not _validate_entry(entry_type, block_id, content_len,
-                               timestamp_ms, remaining,
+                               timestamp_ms, flags, remaining,
                                entries[-1] if entries else None):
             pos += 1
             continue
