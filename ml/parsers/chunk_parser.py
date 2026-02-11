@@ -142,6 +142,40 @@ def _validate_entry(entry_type: int, block_id: int, content_len: int,
     return True
 
 
+def _scan_for_entry(stream: bytes, start: int, total_size: int,
+                    prev_entry: PayloadEntry | None,
+                    max_scan: int = 2_000_000) -> int:
+    """
+    Fast scan for next valid entry header starting from `start`.
+    Uses bytes.find() for speed instead of byte-by-byte Python loop.
+    Returns offset of valid header, or -1 if not found within max_scan bytes.
+    """
+    end = min(start + max_scan, total_size)
+    pos = start
+
+    while pos < end:
+        # Find next 0x01 byte (chunk marker)
+        idx1 = stream.find(b"\x01", pos, end)
+        # Find next 0x02 byte (keyframe marker)
+        idx2 = stream.find(b"\x02", pos, end)
+
+        # Pick whichever comes first
+        candidates = [i for i in (idx1, idx2) if i >= 0]
+        if not candidates:
+            return -1
+
+        next_pos = min(candidates)
+        hdr = _read_entry_header(stream, next_pos)
+        if hdr is not None:
+            remaining = total_size - next_pos
+            if _validate_entry(*hdr, remaining, prev_entry):
+                return next_pos
+
+        pos = next_pos + 1
+
+    return -1
+
+
 def parse_payload_stream(frames: list[bytes]) -> PayloadParseResult:
     """
     Concatenate decompressed frames and parse the payload stream into
@@ -153,76 +187,64 @@ def parse_payload_stream(frames: list[bytes]) -> PayloadParseResult:
     Returns:
         PayloadParseResult with extracted entries.
     """
-    # Concatenate all frames into one stream
     stream = b"".join(frames)
     total_size = len(stream)
 
     entries: list[PayloadEntry] = []
     errors: list[str] = []
     pos = 0
+    scan_failures = 0
+
+    print(f"  Stream size: {total_size:,} bytes")
 
     while pos < total_size - ENTRY_HEADER_SIZE:
         hdr = _read_entry_header(stream, pos)
 
-        if hdr is None:
-            # Not a valid header at this position — scan forward
-            # Look for next type byte (0x01 or 0x02)
-            found = False
-            scan_start = pos
-            for scan_pos in range(pos + 1, min(pos + 1024, total_size)):
-                if stream[scan_pos] in (CHUNK_TYPE, KEYFRAME_TYPE):
-                    test_hdr = _read_entry_header(stream, scan_pos)
-                    if test_hdr is not None:
-                        remaining = total_size - scan_pos
-                        prev = entries[-1] if entries else None
-                        if _validate_entry(*test_hdr, remaining, prev):
-                            skipped = scan_pos - pos
-                            if skipped > 0:
-                                errors.append(f"Skipped {skipped}B at offset {pos}")
-                            pos = scan_pos
-                            found = True
-                            break
-
-            if not found:
-                # No valid header found in next 1KB — we're lost
-                # Try jumping further
-                errors.append(f"Lost sync at offset {pos}, scanning...")
-                pos += 1
-                continue
-
-            # Re-read header at new position
-            hdr = _read_entry_header(stream, pos)
-            if hdr is None:
-                pos += 1
-                continue
-
-        entry_type, block_id, content_len, timestamp_ms, flags = hdr
-        remaining = total_size - pos
-
-        if not _validate_entry(entry_type, block_id, content_len,
+        if hdr is not None:
+            entry_type, block_id, content_len, timestamp_ms, flags = hdr
+            remaining = total_size - pos
+            if _validate_entry(entry_type, block_id, content_len,
                                timestamp_ms, flags, remaining,
                                entries[-1] if entries else None):
-            pos += 1
-            continue
+                # Valid entry — extract content
+                content_start = pos + ENTRY_HEADER_SIZE
+                content_end = content_start + content_len
+                content = stream[content_start:content_end]
 
-        # Extract content
-        content_start = pos + ENTRY_HEADER_SIZE
-        content_end = content_start + content_len
-        content = stream[content_start:content_end]
+                entries.append(PayloadEntry(
+                    entry_type=entry_type,
+                    block_id=block_id,
+                    content_length=content_len,
+                    timestamp_ms=timestamp_ms,
+                    flags=flags,
+                    content=content,
+                    stream_offset=pos,
+                ))
 
-        entries.append(PayloadEntry(
-            entry_type=entry_type,
-            block_id=block_id,
-            content_length=content_len,
-            timestamp_ms=timestamp_ms,
-            flags=flags,
-            content=content,
-            stream_offset=pos,
-        ))
+                pos = content_end
 
-        pos = content_end
+                if len(entries) % 10 == 0:
+                    print(f"  ... found {len(entries)} entries "
+                          f"({pos:,}/{total_size:,} = {pos/total_size:.0%})")
+                continue
+
+        # Not a valid entry at `pos` — scan forward
+        scan_result = _scan_for_entry(stream, pos + 1, total_size,
+                                      entries[-1] if entries else None)
+        if scan_result >= 0:
+            skipped = scan_result - pos
+            if skipped > 0:
+                errors.append(f"Skipped {skipped:,}B at offset {pos:,}")
+            pos = scan_result
+        else:
+            # No valid entry found in next 2MB — we're done
+            errors.append(f"Lost sync at offset {pos:,}, "
+                          f"remaining {total_size - pos:,}B unparsed")
+            break
 
     bytes_consumed = sum(ENTRY_HEADER_SIZE + e.content_length for e in entries)
+
+    print(f"  Done: {len(entries)} entries found")
 
     return PayloadParseResult(
         entries=entries,
