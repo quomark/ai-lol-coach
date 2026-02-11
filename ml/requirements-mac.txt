@@ -1,0 +1,16 @@
+# ML dependencies for Apple Silicon (Mac Mini M-series)
+# Install with: pip install -r ml/requirements-mac.txt
+
+mlx>=0.21.0
+mlx-lm>=0.21.0
+
+# Data processing
+datasets>=3.2.0
+huggingface-hub>=0.27.0
+numpy>=1.26.0
+pandas>=2.2.0
+tqdm>=4.67.0
+
+# For inference (MLX handles training, transformers for tokenizer utils)
+transformers>=4.46.0
+safetensors>=0.4.5

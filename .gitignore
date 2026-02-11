@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+uploads/
+models/
+*.egg-info/
+dist/
+build/
+.venv/
+node_modules/
+.next/
+ml/data/raw/
+ml/data/processed/
+ml/models/

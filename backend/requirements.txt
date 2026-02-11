@@ -1,0 +1,27 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.4
+pydantic-settings==2.7.1
+httpx==0.28.1
+structlog==24.4.0
+
+# ML / Data
+torch>=2.1.0
+transformers>=4.46.0
+datasets>=3.2.0
+peft>=0.14.0
+accelerate>=1.2.0
+bitsandbytes>=0.45.0
+huggingface-hub>=0.27.0
+safetensors>=0.4.5
+
+# Replay parsing
+construct>=2.10.70
+zstandard>=0.23.0
+
+# Utils
+numpy>=1.26.0
+pandas>=2.2.0
+tqdm>=4.67.0
+orjson>=3.10.0
