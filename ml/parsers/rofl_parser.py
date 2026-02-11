@@ -175,11 +175,26 @@ class ROFLParser:
         """
         Decompress game payload (multi-frame zstd).
 
-        The payload contains many zstd frames (one per chunk/keyframe)
-        possibly interleaved with non-zstd binary headers.
-        We decompress greedily and tolerate errors at frame boundaries.
+        The payload contains ~80 zstd frames (one per chunk/keyframe)
+        interleaved with non-zstd binary chunk headers.
+        We decompress each frame individually.
 
         Requires ``zstandard``.
+        """
+        if not HAS_ZSTD:
+            raise ImportError("pip install zstandard")
+
+        frames = self.decompress_payload_frames()
+        if not frames:
+            raise ValueError("No decompressible zstd frames in payload")
+        return b"".join(frames)
+
+    def decompress_payload_frames(self) -> list[bytes]:
+        """
+        Decompress each zstd frame in the payload individually.
+
+        Returns a list of decompressed byte strings, one per frame.
+        Frames correspond to game chunks and keyframes.
         """
         if not HAS_ZSTD:
             raise ImportError("pip install zstandard")
@@ -187,39 +202,31 @@ class ROFLParser:
         raw = self.get_compressed_payload()
         dctx = zstandard.ZstdDecompressor()
 
-        # Approach 1: stream_reader with chunked reads (handles multi-frame)
-        buf = io.BytesIO()
-        reader = dctx.stream_reader(io.BytesIO(raw))
-        try:
-            while True:
-                chunk = reader.read(65536)
-                if not chunk:
-                    break
-                buf.write(chunk)
-        except zstandard.ZstdError:
-            pass  # hit non-zstd data after valid frames — expected
-
-        if buf.tell() > 0:
-            return buf.getvalue()
-
-        # Approach 2: decompress individual frames by scanning for magic
         frames: list[bytes] = []
         pos = 0
         while pos < len(raw) - 4:
             idx = raw.find(ZSTD_MAGIC, pos)
             if idx < 0:
                 break
+
+            # Decompress one frame via stream_reader (handles trailing data)
+            frame_buf = io.BytesIO()
             try:
-                frame = dctx.decompress(raw[idx:], max_output_size=50_000_000)
-                frames.append(frame)
+                reader = dctx.stream_reader(io.BytesIO(raw[idx:]))
+                while True:
+                    chunk = reader.read(65536)
+                    if not chunk:
+                        break
+                    frame_buf.write(chunk)
             except zstandard.ZstdError:
-                pass
+                pass  # hit non-zstd data after frame — expected
+
+            if frame_buf.tell() > 0:
+                frames.append(frame_buf.getvalue())
+
             pos = idx + 4
 
-        if frames:
-            return b"".join(frames)
-
-        raise ValueError("No decompressible zstd frames in payload")
+        return frames
 
     def payload_frame_count(self) -> int:
         """Count zstd frame magic occurrences in the payload."""

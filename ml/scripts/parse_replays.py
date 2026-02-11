@@ -5,11 +5,13 @@ Modes:
   inspect  — Dump one .rofl file's structure / metadata
   metadata — Extract metadata from all replays (fast, no decryption)
   events   — Decompress payload and probe for game events (experimental)
+  packets  — Decode decompressed frames into raw game packets
 
 Usage:
     python -m ml.scripts.parse_replays --mode inspect
     python -m ml.scripts.parse_replays --mode metadata
     python -m ml.scripts.parse_replays --mode events
+    python -m ml.scripts.parse_replays --mode packets [--file X.rofl]
 """
 
 import argparse
@@ -149,20 +151,26 @@ def mode_inspect(filepath: str):
     else:
         print(f"\n  No player stats found in statsJson")
 
-    # Payload decompression
+    # Payload decompression — frame by frame
     try:
-        payload = p.decompress_payload()
+        frames = p.decompress_payload_frames()
+        total = sum(len(f) for f in frames)
         print(f"\n── Decompressed Payload ──")
-        print(f"  Size: {len(payload):,} bytes ({len(payload)/1024/1024:.1f} MB)")
-        print(f"  First 200 bytes (hex): {payload[:200].hex()}")
-        # Look for recognizable structures
-        for marker in (b"KeyFrame", b"Chunk", b"gameData", b"player", b"position",
-                       b"champion", b"spell", b"item", b"gold", b"kill", b"death"):
-            idx = payload.find(marker)
-            if idx >= 0:
-                ctx = payload[max(0, idx-20):idx+50]
-                print(f"  Found '{marker.decode()}' at offset {idx}")
-                print(f"    Context: {ctx.hex()}")
+        print(f"  Frames decompressed: {len(frames)} / {n_frames}")
+        print(f"  Total decompressed:  {total:,} bytes ({total/1024/1024:.1f} MB)")
+        if frames:
+            sizes = [len(f) for f in frames]
+            print(f"  Frame sizes: min={min(sizes):,}  max={max(sizes):,}  avg={sum(sizes)//len(sizes):,}")
+            print(f"\n  Frame 0 ({len(frames[0]):,} B) first 200 hex:")
+            print(f"    {frames[0][:200].hex()}")
+            if len(frames) > 1:
+                print(f"\n  Frame 1 ({len(frames[1]):,} B) first 200 hex:")
+                print(f"    {frames[1][:200].hex()}")
+            # Check the biggest frame (likely a keyframe)
+            biggest_idx = sizes.index(max(sizes))
+            biggest = frames[biggest_idx]
+            print(f"\n  Biggest frame #{biggest_idx} ({len(biggest):,} B) first 200 hex:")
+            print(f"    {biggest[:200].hex()}")
     except ImportError:
         print(f"\n  (Install zstandard to decompress payload: pip install zstandard)")
     except Exception as e:
@@ -236,34 +244,180 @@ def mode_events(replay_dir: str, output_dir: str):
     print("Done!")
 
 
+# ── packets ────────────────────────────────────────────────────────────
+
+
+def mode_packets(filepath: str, max_frames: int = 10):
+    """Decompress frames and parse into individual game packets."""
+    from ml.parsers.chunk_parser import (
+        parse_all_frames,
+        channel_breakdown,
+        packet_type_histogram,
+        packet_type_histogram_u16,
+    )
+
+    p = ROFLParser(filepath)
+    parsed = p.parse()
+    meta = parsed.metadata
+
+    game_ms = meta.get("gameLength", 0)
+    n_chunks = meta.get("lastGameChunkId", 0)
+    n_keyframes = meta.get("lastKeyFrameId", 0)
+
+    print(f"\n{'='*70}")
+    print(f"File:        {filepath}")
+    print(f"Game:        {game_ms // 60000}m {(game_ms % 60000) // 1000}s")
+    print(f"Expected:    {n_chunks} chunks + {n_keyframes} keyframes = {n_chunks + n_keyframes} frames")
+    print(f"{'='*70}")
+
+    # Decompress all frames
+    print(f"\nDecompressing payload frames...")
+    try:
+        frames = p.decompress_payload_frames()
+    except Exception as e:
+        print(f"  FAILED: {e}")
+        return
+
+    print(f"  Got {len(frames)} frames, total {sum(len(f) for f in frames):,} bytes decompressed")
+
+    if not frames:
+        print("  No frames to parse!")
+        return
+
+    # Parse all frames
+    print(f"\nParsing packet stream from each frame...")
+    parsed_frames = parse_all_frames(frames)
+
+    # Summary table
+    total_pkts = 0
+    total_parsed_bytes = 0
+    total_frame_bytes = 0
+
+    print(f"\n{'─'*90}")
+    print(f"{'Frame':>7s} | {'Type':<8s} | {'Size':>10s} | {'Packets':>7s} | "
+          f"{'Parsed':>7s} | {'Channels':<16s} | {'Pkt sizes':<16s}")
+    print(f"{'─'*90}")
+
+    show_count = min(len(parsed_frames), max_frames)
+    for pf in parsed_frames[:show_count]:
+        h = pf.header
+        n = len(pf.packets)
+        ratio = pf.parse_ratio
+        sizes = [pk.size for pk in pf.packets] if pf.packets else [0]
+        channels = sorted(set(pk.channel for pk in pf.packets))
+
+        print(f"  {pf.index:>5d} | {h.frame_type_name:<8s} | {pf.raw_size:>8,} B | "
+              f"{n:>5d}   | {ratio:>5.0%}   | "
+              f"{str(channels):<16s} | {min(sizes)}-{max(sizes)}")
+
+        total_pkts += n
+        total_parsed_bytes += pf.bytes_parsed
+        total_frame_bytes += pf.raw_size - h.header_size
+
+    if len(parsed_frames) > max_frames:
+        for pf in parsed_frames[max_frames:]:
+            total_pkts += len(pf.packets)
+            total_parsed_bytes += pf.bytes_parsed
+            total_frame_bytes += pf.raw_size - pf.header.header_size
+        print(f"  ... ({len(parsed_frames) - max_frames} more frames)")
+
+    print(f"{'─'*90}")
+    pct = (total_parsed_bytes / total_frame_bytes * 100) if total_frame_bytes else 0
+    print(f"  TOTAL: {len(parsed_frames)} frames, {total_pkts:,} packets, "
+          f"{total_parsed_bytes:,}/{total_frame_bytes:,} bytes parsed ({pct:.1f}%)")
+
+    # Channel breakdown
+    ch_stats = channel_breakdown(parsed_frames)
+    if ch_stats:
+        print(f"\n── Channel breakdown ──")
+        print(f"  {'Ch':>3s} | {'Count':>8s} | {'Total bytes':>12s} | {'Avg size':>8s} | {'Range'}")
+        for ch, s in ch_stats.items():
+            print(f"  {ch:>3d} | {s['count']:>8,} | {s['total_bytes']:>10,} B | "
+                  f"{s['avg_size']:>6d} B | {s['min_size']}-{s['max_size']}")
+
+    # Packet type histogram (first byte)
+    ptype_hist = packet_type_histogram(parsed_frames)
+    if ptype_hist:
+        print(f"\n── Packet types (by first byte, top 20) ──")
+        print(f"  {'Type':>6s} | {'Count':>8s} | {'Hex'}")
+        for ptype, count in list(ptype_hist.items())[:20]:
+            print(f"  {ptype:>6d} | {count:>8,} | 0x{ptype:02X}")
+
+    # Packet type histogram (first 2 bytes as u16)
+    ptype16_hist = packet_type_histogram_u16(parsed_frames)
+    if ptype16_hist:
+        print(f"\n── Packet types (by first u16 LE, top 20) ──")
+        print(f"  {'Type':>6s} | {'Count':>8s} | {'Hex'}")
+        for ptype, count in list(ptype16_hist.items())[:20]:
+            print(f"  {ptype:>6d} | {count:>8,} | 0x{ptype:04X}")
+
+    # Show errors if any
+    all_errors = [(pf.index, e) for pf in parsed_frames for e in pf.errors]
+    if all_errors:
+        print(f"\n── Parse errors ({len(all_errors)}) ──")
+        for idx, err in all_errors[:20]:
+            print(f"  Frame {idx}: {err}")
+
+    # Hex dump of first few packets from frame 0
+    if parsed_frames and parsed_frames[0].packets:
+        pkts = parsed_frames[0].packets
+        print(f"\n── First 10 packets from frame 0 ──")
+        for i, pk in enumerate(pkts[:10]):
+            hex_preview = pk.data[:40].hex() if pk.data else "(empty)"
+            time_str = f"t={pk.time_abs:.3f}s" if pk.time_abs >= 0 else f"dt={pk.time_delta}"
+            print(f"  [{i:>3d}] {time_str:<14s} ch={pk.channel} size={pk.size:>5d}  {hex_preview}")
+
+    # Frame header details
+    print(f"\n── Frame headers (first {min(5, len(parsed_frames))}) ──")
+    for pf in parsed_frames[:5]:
+        h = pf.header
+        print(f"  Frame {pf.index}: type={h.frame_type} ({h.frame_type_name}) "
+              f"hdr={h.header_size}B content={h.content_length}B "
+              f"extra={h.extra_fields}")
+
+    # Raw hex of first frame header + start
+    if frames:
+        print(f"\n── Raw hex: frame 0 first 64 bytes ──")
+        raw = frames[0][:64]
+        for off in range(0, len(raw), 16):
+            chunk = raw[off:off + 16]
+            hex_part = " ".join(f"{b:02x}" for b in chunk)
+            ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            print(f"  {off:04x}: {hex_part:<48s} {ascii_part}")
+
+
 # ── main ───────────────────────────────────────────────────────────────
 
 
 def main():
     ap = argparse.ArgumentParser(description="Parse .rofl replay files")
-    ap.add_argument("--mode", default="inspect", choices=["inspect", "metadata", "events"])
-    ap.add_argument("--file", type=str, help="Single file (inspect mode)")
+    ap.add_argument("--mode", default="inspect", choices=["inspect", "metadata", "events", "packets"])
+    ap.add_argument("--file", type=str, help="Single file (inspect/packets mode)")
     ap.add_argument("--replay-dir", default="./ml/data/raw/high_elo/replays")
     ap.add_argument("--output", default="./ml/data/processed/replay_metadata.json",
                     help="Output file (metadata) or dir (events)")
+    ap.add_argument("--max-frames", type=int, default=10,
+                    help="Max frames to show in packets mode")
     args = ap.parse_args()
 
-    if args.mode == "inspect":
-        if not args.file:
-            replay_dir = Path(args.replay_dir)
-            files = sorted(replay_dir.glob("*.rofl"))
-            if not files:
-                print(f"No .rofl files in {replay_dir}")
-                return
-            args.file = str(files[0])
-            print(f"  (Auto-selected: {args.file})")
-        mode_inspect(args.file)
+    # Auto-select file for single-file modes
+    if args.mode in ("inspect", "packets") and not args.file:
+        replay_dir = Path(args.replay_dir)
+        files = sorted(replay_dir.glob("*.rofl"))
+        if not files:
+            print(f"No .rofl files in {replay_dir}")
+            return
+        args.file = str(files[0])
+        print(f"  (Auto-selected: {args.file})")
 
+    if args.mode == "inspect":
+        mode_inspect(args.file)
     elif args.mode == "metadata":
         mode_metadata(args.replay_dir, args.output)
-
     elif args.mode == "events":
         mode_events(args.replay_dir, args.output)
+    elif args.mode == "packets":
+        mode_packets(args.file, max_frames=args.max_frames)
 
 
 if __name__ == "__main__":
