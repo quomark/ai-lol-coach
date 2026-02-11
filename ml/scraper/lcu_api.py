@@ -228,73 +228,72 @@ class LCUClient:
         """
         Launch a local .rofl file.
 
-        Strategy 1: Extract game ID, use LCU watch endpoint
-        Strategy 2: Launch game executable directly with .rofl as argument
-        Strategy 3: Use /lol-replays/v1/rofls/{id}/watch/download then watch
+        Strategies (in order):
+          1. Direct game exe launch (op.gg style — most reliable)
+          2. LCU watch endpoint
+          3. OS file handler (double-click equivalent)
         """
-        from pathlib import Path
-        import subprocess
-        import re
-
         rofl = Path(rofl_path)
         if not rofl.exists():
             print(f"  [ERROR] File not found: {rofl_path}")
             return False
 
-        # Extract game ID from filename (e.g., "NA1_5480593641.replay.rofl" → "NA1_5480593641")
-        # or "TW2-388023029.rofl" → "TW2_388023029"
+        abs_path = str(rofl.resolve())
         stem = rofl.stem.replace(".replay", "")
-        # Normalize: TW2-388023029 → TW2_388023029
-        game_id = stem.replace("-", "_")
-        game_id_dash = stem  # Keep original for some endpoints
+        print(f"  [INFO] File: {rofl.name}")
 
-        print(f"  [INFO] Game ID: {game_id} | File: {rofl.name}")
-
-        # Strategy 1: Try LCU download + watch endpoint with game ID
-        for gid in (game_id_dash, game_id, stem):
-            # First try to "create" the replay entry by POSTing the path
-            self._post(f"/lol-replays/v1/rofls/{gid}/download", {
-                "gameId": gid,
-                "filePath": str(rofl.resolve()),
-            })
-            # Then watch it
-            result = self._post(f"/lol-replays/v1/rofls/{gid}/watch")
-            if result is not None:
-                print(f"  [OK] Launched via LCU watch endpoint")
-                return True
-
-        # Strategy 2: POST with componentType replay
-        result = self._post("/riotclient/launch-ux", {
-            "args": [str(rofl.resolve())],
-        })
-        if result is not None:
-            print(f"  [OK] Launched via riotclient/launch-ux")
-            return True
-
-        # Strategy 3: Find game executable and launch directly
-        game_exe = self._find_game_exe()
+        # Strategy 1: Direct game executable launch (op.gg approach)
+        # This is the most reliable — bypasses LCU entirely
+        game_exe, game_dir = self._find_game_exe()
         if game_exe:
             try:
-                abs_path = str(rofl.resolve())
-                print(f"  [INFO] Launching directly: {game_exe} \"{abs_path}\"")
-                subprocess.Popen(
-                    [str(game_exe), abs_path],
-                    cwd=str(game_exe.parent),
-                )
-                print(f"  [OK] Launched game process directly")
+                env = os.environ.copy()
+                env["riot_launched"] = "true"
+
+                if sys.platform == "darwin":
+                    # Mac: ./LeagueofLegends.app/Contents/MacOS/LeagueofLegends
+                    cmd = [
+                        str(game_exe),
+                        abs_path,
+                        "-UseRads",
+                        f"-GameBaseDir={game_dir}",
+                    ]
+                else:
+                    # Windows: League of Legends.exe
+                    cmd = [
+                        str(game_exe),
+                        abs_path,
+                        f"-GameBaseDir={game_dir}",
+                    ]
+
+                print(f"  [INFO] Direct launch: {' '.join(cmd[:2])}...")
+                subprocess.Popen(cmd, cwd=str(game_exe.parent), env=env)
+                print(f"  [OK] Game process launched directly")
                 return True
             except Exception as e:
                 print(f"  [WARN] Direct launch failed: {e}")
 
-        # Strategy 4: Open file with OS default handler (double-click equivalent)
+        # Strategy 2: LCU watch endpoint (needs game ID in client's replay list)
+        game_id = stem.replace("-", "_")
+        for gid in (stem, game_id):
+            self._post(f"/lol-replays/v1/rofls/{gid}/download", {
+                "gameId": gid,
+                "filePath": abs_path,
+            })
+            result = self._post(f"/lol-replays/v1/rofls/{gid}/watch")
+            if result is not None:
+                print(f"  [OK] Launched via LCU /rofls/{gid}/watch")
+                return True
+
+        # Strategy 3: OS file handler (double-click .rofl)
         try:
             if sys.platform == "win32":
-                os.startfile(str(rofl.resolve()))
+                os.startfile(abs_path)
             elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(rofl.resolve())])
+                subprocess.Popen(["open", abs_path])
             else:
-                subprocess.Popen(["xdg-open", str(rofl.resolve())])
-            print(f"  [OK] Launched via OS file handler (double-click)")
+                subprocess.Popen(["xdg-open", abs_path])
+            print(f"  [OK] Launched via OS file handler")
             return True
         except Exception as e:
             print(f"  [WARN] OS handler failed: {e}")
@@ -302,23 +301,69 @@ class LCUClient:
         print(f"  [FAIL] All launch strategies failed")
         return False
 
-    def _find_game_exe(self) -> Path | None:
-        """Find the League of Legends game executable."""
-        from pathlib import Path
-        candidates = [
-            Path("C:/Riot Games/League of Legends/Game/League of Legends.exe"),
-            Path("D:/Riot Games/League of Legends/Game/League of Legends.exe"),
-            Path(os.path.expanduser("~/Riot Games/League of Legends/Game/League of Legends.exe")),
-        ]
-        # Also try to get install path from LCU
-        install_dir = self._get("/lol-patch/v1/game-path")
-        if install_dir and isinstance(install_dir, str):
-            candidates.insert(0, Path(install_dir) / "League of Legends.exe")
+    def _find_game_exe(self) -> tuple[Path | None, str]:
+        """
+        Find the League of Legends game executable.
+        Returns (exe_path, game_base_dir) or (None, "").
 
-        for p in candidates:
-            if p.exists():
-                return p
-        return None
+        Windows: C:/Riot Games/League of Legends/Game/League of Legends.exe
+        Mac:     /Applications/League of Legends.app/Contents/LoL/Game/
+                   LeagueofLegends.app/Contents/MacOS/LeagueofLegends
+        """
+        if sys.platform == "darwin":
+            # Mac paths
+            mac_candidates = [
+                (
+                    Path("/Applications/League of Legends.app/Contents/LoL/Game/"
+                         "LeagueofLegends.app/Contents/MacOS/LeagueofLegends"),
+                    "/Applications/League of Legends.app/Contents/LoL/Game"
+                ),
+            ]
+            # Also check RADS path (older installs)
+            rads_base = Path("/Applications/League of Legends.app/Contents/LoL/RADS/"
+                             "solutions/lol_game_client_sln/releases")
+            if rads_base.exists():
+                # Find latest version directory
+                versions = sorted(rads_base.iterdir(), reverse=True)
+                if versions:
+                    rads_exe = versions[0] / "deploy/LeagueofLegends.app/Contents/MacOS/LeagueofLegends"
+                    rads_dir = str(versions[0] / "deploy")
+                    mac_candidates.append((rads_exe, rads_dir))
+
+            for exe, base_dir in mac_candidates:
+                if exe.exists():
+                    return exe, base_dir
+
+        else:
+            # Windows paths
+            win_candidates = [
+                Path("C:/Riot Games/League of Legends/Game/League of Legends.exe"),
+                Path("D:/Riot Games/League of Legends/Game/League of Legends.exe"),
+                Path(os.path.expanduser("~/Riot Games/League of Legends/Game/League of Legends.exe")),
+            ]
+
+            # Try to get install path from LCU
+            install_dir = self._get("/lol-patch/v1/game-path")
+            if install_dir and isinstance(install_dir, str):
+                win_candidates.insert(0, Path(install_dir) / "League of Legends.exe")
+
+            # Try to find via running process
+            try:
+                for proc in psutil.process_iter(["name", "exe"]):
+                    if proc.info["name"] and "LeagueClient" in proc.info["name"]:
+                        client_dir = Path(proc.info["exe"]).parent
+                        game_exe = client_dir / "Game" / "League of Legends.exe"
+                        if game_exe.exists():
+                            win_candidates.insert(0, game_exe)
+                        break
+            except Exception:
+                pass
+
+            for p in win_candidates:
+                if p.exists():
+                    return p, str(p.parent)
+
+        return None, ""
 
     def get_replay_dir(self) -> str | None:
         """Get the client's replay directory."""
