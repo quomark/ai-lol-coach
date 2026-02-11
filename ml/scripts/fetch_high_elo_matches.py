@@ -173,15 +173,19 @@ def fetch_and_save(
         if len(all_match_ids) >= max_matches:
             break
 
-        summoner_id = player.get("summonerId")
         summoner_name = player.get("summonerName", "???")
         lp = player.get("leaguePoints", 0)
 
         print(f"  [{i+1}/{len(players)}] {summoner_name} ({lp} LP)...", end=" ")
 
-        puuid = client.get_puuid(summoner_id)
+        # League v4 entries now include puuid directly
+        puuid = player.get("puuid")
         if not puuid:
-            print("failed to get PUUID")
+            # Fallback to summoner v4 lookup (needs higher API key tier)
+            summoner_id = player.get("summonerId")
+            puuid = client.get_puuid(summoner_id) if summoner_id else None
+        if not puuid:
+            print("no puuid available")
             continue
 
         match_ids = client.get_match_ids(puuid, count=matches_per_player)
