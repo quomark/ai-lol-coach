@@ -114,7 +114,7 @@ def _read_entry_header(data: bytes, offset: int) -> tuple[int, int, int, int, in
 
 
 def _validate_entry(entry_type: int, block_id: int, content_len: int,
-                    timestamp_ms: int, remaining: int,
+                    timestamp_ms: int, flags: int, remaining: int,
                     prev_entry: PayloadEntry | None) -> bool:
     """Heuristic validation of an entry header."""
     # Content must fit in remaining data
