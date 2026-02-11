@@ -1,21 +1,23 @@
 """
 Fetch high-elo (Challenger/GM/Master) match data from Riot API.
 
-Split into 3 independent steps that save intermediate results:
+Split into independent steps that save intermediate results:
   Step 1: players   — fetch player list + PUUIDs
   Step 2: matchids  — fetch match IDs from those players
-  Step 3: download  — download match data + timelines
+  Step 3: download  — download match data + timelines (macro data)
+  Step 4: replays   — download .rofl replay files (micro data)
 
 Each step is fully resumable. Re-running skips already-completed work.
 
 Usage:
-    # Run all steps:
+    # Run all steps (except replays):
     python -m ml.scripts.fetch_high_elo_matches --region na1 --tier challenger --count 200
 
     # Run individual steps:
     python -m ml.scripts.fetch_high_elo_matches --region na1 --tier challenger --step players
     python -m ml.scripts.fetch_high_elo_matches --region na1 --tier challenger --step matchids
     python -m ml.scripts.fetch_high_elo_matches --region na1 --tier challenger --step download --count 200
+    python -m ml.scripts.fetch_high_elo_matches --region na1 --tier challenger --step replays --count 200
 """
 
 import argparse
@@ -25,7 +27,7 @@ from pathlib import Path
 
 import httpx
 
-RATE_LIMIT_DELAY = 1.3
+RATE_LIMIT_DELAY = 0.05  # Personal key: 2000 req/10s. Use 1.3 for dev keys.
 
 PLATFORM_TO_REGION = {
     "na1": "americas",
@@ -102,6 +104,28 @@ class RiotAPIClient:
     def get_match_timeline(self, match_id: str) -> dict | None:
         url = f"https://{self.region}.api.riotgames.com/lol/match/v5/matches/{match_id}/timeline"
         return self._get(url)
+
+    def get_player_replays(self, puuid: str) -> list[str]:
+        """Get .rofl replay file URLs for a player's recent matches."""
+        url = f"https://{self.region}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/replays"
+        data = self._get(url)
+        if data and isinstance(data, dict):
+            return data.get("matchFileURLs", [])
+        return []
+
+    def download_file(self, url: str, dest: Path) -> bool:
+        """Download a file (e.g. .rofl) to disk."""
+        try:
+            with self.client.stream("GET", url) as resp:
+                if resp.status_code != 200:
+                    return False
+                with open(dest, "wb") as f:
+                    for chunk in resp.iter_bytes(chunk_size=8192):
+                        f.write(chunk)
+            return True
+        except Exception as e:
+            print(f"  Download error: {e}")
+            return False
 
 
 # ── Step 1: Fetch players ─────────────────────────────────────────────
@@ -291,6 +315,92 @@ def step_download(client: RiotAPIClient, output_dir: Path, max_matches: int):
     print(f"  Total in {output_dir}: {len(existing) + downloaded}")
 
 
+# ── Step 4: Download .rofl replays ─────────────────────────────────────
+
+def step_replays(client: RiotAPIClient, output_dir: Path, max_replays: int):
+    """Download .rofl replay files for players. Resumable."""
+    players_file = output_dir / "players.json"
+    replays_dir = output_dir / "replays"
+    replays_dir.mkdir(parents=True, exist_ok=True)
+    replay_log = output_dir / "replays_log.jsonl"
+
+    if not players_file.exists():
+        print("  ERROR: Run --step players first!")
+        return
+
+    players = json.loads(players_file.read_text())
+
+    # Track already-downloaded replays
+    downloaded_urls = set()
+    if replay_log.exists():
+        with open(replay_log) as f:
+            for line in f:
+                try:
+                    downloaded_urls.add(json.loads(line)["url"])
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+    print(f"\n=== Step 4: Downloading .rofl replays ===")
+    print(f"  Already downloaded: {len(downloaded_urls)}")
+
+    total_downloaded = len(downloaded_urls)
+    failed = 0
+
+    for i, player in enumerate(players):
+        if total_downloaded >= max_replays:
+            break
+
+        puuid = player.get("puuid")
+        if not puuid:
+            continue
+
+        name = player.get("summonerName", "???")
+        lp = player.get("leaguePoints", 0)
+        print(f"  [{i+1}/{len(players)}] {name} ({lp} LP)...", end=" ")
+
+        replay_urls = client.get_player_replays(puuid)
+        if not replay_urls:
+            print("no replays")
+            continue
+
+        new_urls = [u for u in replay_urls if u not in downloaded_urls]
+        print(f"{len(new_urls)} new replays")
+
+        for url in new_urls:
+            if total_downloaded >= max_replays:
+                break
+
+            # Extract filename from URL or generate one
+            fname = url.split("/")[-1] if "/" in url else f"{puuid}_{total_downloaded}.rofl"
+            if not fname.endswith(".rofl"):
+                fname += ".rofl"
+            dest = replays_dir / fname
+
+            if dest.exists():
+                total_downloaded += 1
+                continue
+
+            print(f"    Downloading {fname}...", end=" ")
+            if client.download_file(url, dest):
+                # Log it
+                with open(replay_log, "a") as f:
+                    f.write(json.dumps({
+                        "url": url,
+                        "file": str(dest),
+                        "puuid": puuid,
+                        "player": name,
+                    }) + "\n")
+                total_downloaded += 1
+                size_mb = dest.stat().st_size / (1024 * 1024)
+                print(f"ok ({size_mb:.1f} MB)")
+            else:
+                failed += 1
+                print("failed")
+
+    print(f"\n  Done! Total replays: {total_downloaded}, failed: {failed}")
+    print(f"  Saved to: {replays_dir}")
+
+
 # ── CLI ────────────────────────────────────────────────────────────────
 
 def load_api_key(args_key: str | None) -> str:
@@ -317,7 +427,7 @@ def main():
     parser.add_argument("--matches-per-player", type=int, default=5)
     parser.add_argument("--output", type=str, default="./ml/data/raw/high_elo")
     parser.add_argument("--step", type=str, default="all",
-                        choices=["all", "players", "matchids", "download"],
+                        choices=["all", "players", "matchids", "download", "replays"],
                         help="Run a specific step (default: all)")
     args = parser.parse_args()
 
@@ -338,6 +448,9 @@ def main():
 
     if args.step in ("all", "download"):
         step_download(client, output_dir, args.count)
+
+    if args.step == "replays":
+        step_replays(client, output_dir, args.count)
 
 
 if __name__ == "__main__":
