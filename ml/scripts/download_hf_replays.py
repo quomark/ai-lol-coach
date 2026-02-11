@@ -47,11 +47,9 @@ except ImportError:
 
 OUTPUT_DIR = Path("ml/data/raw/hf_replays")
 
-# Known Maknee dataset IDs (update if URLs change)
+# Known Maknee dataset IDs (confirmed from blog + HuggingFace)
 KNOWN_DATASETS = [
-    "Maknee/league-of-legends-replays",
-    "Maknee/league-of-legends-replays-2",
-    "Maknee/league-of-legends-decoded-replay-packets",
+    "maknee/league-of-legends-decoded-replay-packets",  # primary — decoded JSON events
 ]
 
 

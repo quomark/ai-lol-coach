@@ -248,12 +248,14 @@ def mode_events(replay_dir: str, output_dir: str):
 
 
 def mode_packets(filepath: str, max_frames: int = 10):
-    """Decompress frames and parse into individual game packets."""
+    """
+    Decompress frames, concatenate into one stream, and parse
+    chunk/keyframe entries from the payload.
+    """
     from ml.parsers.chunk_parser import (
-        parse_all_frames,
-        channel_breakdown,
-        packet_type_histogram,
-        packet_type_histogram_u16,
+        parse_payload_stream,
+        print_payload_summary,
+        try_inner_packet_parse,
     )
 
     p = ROFLParser(filepath)
@@ -270,7 +272,7 @@ def mode_packets(filepath: str, max_frames: int = 10):
     print(f"Expected:    {n_chunks} chunks + {n_keyframes} keyframes = {n_chunks + n_keyframes} frames")
     print(f"{'='*70}")
 
-    # Decompress all frames
+    # Decompress all zstd frames
     print(f"\nDecompressing payload frames...")
     try:
         frames = p.decompress_payload_frames()
@@ -278,112 +280,22 @@ def mode_packets(filepath: str, max_frames: int = 10):
         print(f"  FAILED: {e}")
         return
 
-    print(f"  Got {len(frames)} frames, total {sum(len(f) for f in frames):,} bytes decompressed")
+    total_decompressed = sum(len(f) for f in frames)
+    print(f"  Got {len(frames)} zstd frames, {total_decompressed:,} bytes total")
 
     if not frames:
         print("  No frames to parse!")
         return
 
-    # Parse all frames
-    print(f"\nParsing packet stream from each frame...")
-    parsed_frames = parse_all_frames(frames)
+    # Parse the concatenated stream
+    print(f"\nConcatenating and parsing payload stream...")
+    result = parse_payload_stream(frames)
 
-    # Summary table
-    total_pkts = 0
-    total_parsed_bytes = 0
-    total_frame_bytes = 0
+    # Print full summary
+    print_payload_summary(result)
 
-    print(f"\n{'─'*90}")
-    print(f"{'Frame':>7s} | {'Type':<8s} | {'Size':>10s} | {'Packets':>7s} | "
-          f"{'Parsed':>7s} | {'Channels':<16s} | {'Pkt sizes':<16s}")
-    print(f"{'─'*90}")
-
-    show_count = min(len(parsed_frames), max_frames)
-    for pf in parsed_frames[:show_count]:
-        h = pf.header
-        n = len(pf.packets)
-        ratio = pf.parse_ratio
-        sizes = [pk.size for pk in pf.packets] if pf.packets else [0]
-        channels = sorted(set(pk.channel for pk in pf.packets))
-
-        print(f"  {pf.index:>5d} | {h.frame_type_name:<8s} | {pf.raw_size:>8,} B | "
-              f"{n:>5d}   | {ratio:>5.0%}   | "
-              f"{str(channels):<16s} | {min(sizes)}-{max(sizes)}")
-
-        total_pkts += n
-        total_parsed_bytes += pf.bytes_parsed
-        total_frame_bytes += pf.raw_size - h.header_size
-
-    if len(parsed_frames) > max_frames:
-        for pf in parsed_frames[max_frames:]:
-            total_pkts += len(pf.packets)
-            total_parsed_bytes += pf.bytes_parsed
-            total_frame_bytes += pf.raw_size - pf.header.header_size
-        print(f"  ... ({len(parsed_frames) - max_frames} more frames)")
-
-    print(f"{'─'*90}")
-    pct = (total_parsed_bytes / total_frame_bytes * 100) if total_frame_bytes else 0
-    print(f"  TOTAL: {len(parsed_frames)} frames, {total_pkts:,} packets, "
-          f"{total_parsed_bytes:,}/{total_frame_bytes:,} bytes parsed ({pct:.1f}%)")
-
-    # Channel breakdown
-    ch_stats = channel_breakdown(parsed_frames)
-    if ch_stats:
-        print(f"\n── Channel breakdown ──")
-        print(f"  {'Ch':>3s} | {'Count':>8s} | {'Total bytes':>12s} | {'Avg size':>8s} | {'Range'}")
-        for ch, s in ch_stats.items():
-            print(f"  {ch:>3d} | {s['count']:>8,} | {s['total_bytes']:>10,} B | "
-                  f"{s['avg_size']:>6d} B | {s['min_size']}-{s['max_size']}")
-
-    # Packet type histogram (first byte)
-    ptype_hist = packet_type_histogram(parsed_frames)
-    if ptype_hist:
-        print(f"\n── Packet types (by first byte, top 20) ──")
-        print(f"  {'Type':>6s} | {'Count':>8s} | {'Hex'}")
-        for ptype, count in list(ptype_hist.items())[:20]:
-            print(f"  {ptype:>6d} | {count:>8,} | 0x{ptype:02X}")
-
-    # Packet type histogram (first 2 bytes as u16)
-    ptype16_hist = packet_type_histogram_u16(parsed_frames)
-    if ptype16_hist:
-        print(f"\n── Packet types (by first u16 LE, top 20) ──")
-        print(f"  {'Type':>6s} | {'Count':>8s} | {'Hex'}")
-        for ptype, count in list(ptype16_hist.items())[:20]:
-            print(f"  {ptype:>6d} | {count:>8,} | 0x{ptype:04X}")
-
-    # Show errors if any
-    all_errors = [(pf.index, e) for pf in parsed_frames for e in pf.errors]
-    if all_errors:
-        print(f"\n── Parse errors ({len(all_errors)}) ──")
-        for idx, err in all_errors[:20]:
-            print(f"  Frame {idx}: {err}")
-
-    # Hex dump of first few packets from frame 0
-    if parsed_frames and parsed_frames[0].packets:
-        pkts = parsed_frames[0].packets
-        print(f"\n── First 10 packets from frame 0 ──")
-        for i, pk in enumerate(pkts[:10]):
-            hex_preview = pk.data[:40].hex() if pk.data else "(empty)"
-            time_str = f"t={pk.time_abs:.3f}s" if pk.time_abs >= 0 else f"dt={pk.time_delta}"
-            print(f"  [{i:>3d}] {time_str:<14s} ch={pk.channel} size={pk.size:>5d}  {hex_preview}")
-
-    # Frame header details
-    print(f"\n── Frame headers (first {min(5, len(parsed_frames))}) ──")
-    for pf in parsed_frames[:5]:
-        h = pf.header
-        print(f"  Frame {pf.index}: type={h.frame_type} ({h.frame_type_name}) "
-              f"hdr={h.header_size}B content={h.content_length}B "
-              f"extra={h.extra_fields}")
-
-    # Raw hex of first frame header + start
-    if frames:
-        print(f"\n── Raw hex: frame 0 first 64 bytes ──")
-        raw = frames[0][:64]
-        for off in range(0, len(raw), 16):
-            chunk = raw[off:off + 16]
-            hex_part = " ".join(f"{b:02x}" for b in chunk)
-            ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
-            print(f"  {off:04x}: {hex_part:<48s} {ascii_part}")
+    # Try inner packet parsing on first few chunks
+    try_inner_packet_parse(result, max_entries=3)
 
 
 # ── main ───────────────────────────────────────────────────────────────

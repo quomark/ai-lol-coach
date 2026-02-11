@@ -1,171 +1,260 @@
 """
-Parse decompressed ROFL payload frames into individual game packets.
+Parse decompressed ROFL v2 payload into chunks, keyframes, and raw game packets.
 
-Each decompressed zstd frame contains either a game **Chunk** (~30s of
-incremental data) or a **KeyFrame** (full game state snapshot).
+ROFL v2 payload structure (after zstd decompression):
+  The decompressed payload is a SINGLE byte stream containing sequential
+  chunk and keyframe entries. Zstd frame boundaries do NOT align with
+  chunk boundaries — you MUST concatenate all decompressed frames first.
 
-The binary format inside is Riot's proprietary batched-packet stream.
-This parser extracts raw packets with timestamps and channel IDs.
+  Each entry in the stream:
+    [type:        u8 ]   1 = chunk, 2 = keyframe
+    [block_id:    u32]   sequence number (0, 1, 2, ...)
+    [content_len: u32]   size of the content that follows
+    [timestamp:   u32]   game time in milliseconds
+    [flags:       u16]   unknown / padding
+    [content:     N B]   the actual game data (batched ENet packets)
+    Total header: 15 bytes
 
-Full payload decoding (positions, spell casts, etc.) requires running the
-game engine in an emulator — see Maknee/Sabrina:
-  https://maknee.github.io/blog/2025/League-Data-Scraping/
+  Content (inside each chunk) contains the batched game packets in
+  Riot's proprietary binary format. Full decoding of individual packet
+  payloads (positions, spells, etc.) requires the game engine emulator
+  (see Maknee/Sabrina). We CAN extract packet boundaries if we figure
+  out the inner batch format.
 
-What this CAN extract:
-  - Individual packet boundaries (offset, size)
-  - Game timestamps per packet
-  - ENet channel IDs
-  - Packet type bytes (first 1-2 bytes of payload)
-  - Statistics (packet counts, size distributions, channel breakdown)
+Usage:
+    from ml.parsers.chunk_parser import parse_payload_stream
 
-What this CAN'T do without the game engine:
-  - Map packet type IDs to event names (IDs change per patch)
-  - Decode packet fields (positions, entity IDs, spell names)
+    # frames = list of decompressed zstd frame bytes
+    result = parse_payload_stream(frames)
+    for entry in result.entries:
+        print(entry)
 """
 
 from __future__ import annotations
 
 import struct
+from collections import Counter
 from dataclasses import dataclass, field
 
 
 # ── Data structures ───────────────────────────────────────────────────
 
 
-@dataclass
-class RawPacket:
-    """A single game packet extracted from a frame."""
-    time_delta: int      # raw time delta value (ticks)
-    time_abs: float      # absolute time if available, else -1
-    channel: int         # ENet channel (0-7 typical)
-    size: int            # payload length
-    data: bytes          # raw payload
-    offset: int          # byte offset in frame content
+CHUNK_TYPE = 1
+KEYFRAME_TYPE = 2
+ENTRY_HEADER_SIZE = 15
 
 
 @dataclass
-class FrameHeader:
-    """Header at the start of each decompressed frame."""
-    frame_type: int      # raw type byte
-    frame_type_name: str  # "chunk" | "keyframe" | "unknown"
-    content_length: int
-    header_size: int
-    extra_fields: dict = field(default_factory=dict)
+class PayloadEntry:
+    """A single chunk or keyframe extracted from the payload stream."""
+    entry_type: int          # 1 = chunk, 2 = keyframe
+    block_id: int            # sequence number
+    content_length: int      # declared content size
+    timestamp_ms: int        # game time in ms
+    flags: int               # unknown
+    content: bytes           # raw content data
+    stream_offset: int       # byte offset in concatenated stream
+
+    @property
+    def type_name(self) -> str:
+        return {1: "chunk", 2: "keyframe"}.get(self.entry_type, f"unk({self.entry_type})")
+
+    @property
+    def time_sec(self) -> float:
+        return self.timestamp_ms / 1000.0
+
+    def __repr__(self) -> str:
+        return (f"PayloadEntry({self.type_name} #{self.block_id}, "
+                f"t={self.time_sec:.1f}s, {len(self.content):,}B)")
 
 
 @dataclass
-class ParsedFrame:
-    """Complete parsed frame."""
-    index: int
-    header: FrameHeader
-    packets: list[RawPacket]
-    raw_size: int
-    bytes_parsed: int
+class PayloadParseResult:
+    """Result of parsing the full payload stream."""
+    entries: list[PayloadEntry]
+    total_stream_size: int
+    bytes_consumed: int        # how many bytes were parsed into entries
     errors: list[str] = field(default_factory=list)
 
     @property
+    def n_chunks(self) -> int:
+        return sum(1 for e in self.entries if e.entry_type == CHUNK_TYPE)
+
+    @property
+    def n_keyframes(self) -> int:
+        return sum(1 for e in self.entries if e.entry_type == KEYFRAME_TYPE)
+
+    @property
     def parse_ratio(self) -> float:
-        """Fraction of content bytes successfully parsed into packets."""
-        content = self.raw_size - self.header.header_size
-        return self.bytes_parsed / content if content > 0 else 0.0
+        return self.bytes_consumed / self.total_stream_size if self.total_stream_size else 0
 
 
-# ── Frame header parsing ─────────────────────────────────────────────
+# ── Stream parsing ───────────────────────────────────────────────────
 
 
-def _try_header(data: bytes) -> FrameHeader | None:
+def _read_entry_header(data: bytes, offset: int) -> tuple[int, int, int, int, int] | None:
     """
-    Try to parse the frame header.
-
-    ROFL v2 frame header (observed from 2026 replays):
-      Byte 0:     frame_type  (u8)
-      Bytes 1-4:  field_a     (u32 LE — chunk/keyframe sequence number?)
-      Bytes 5-8:  content_len (u32 LE — size of remaining data)
-      Bytes 9-12: field_b     (u32 LE — game time in ms? or sequence?)
-      Bytes 13-14: field_c    (u16 LE — flags/padding?)
-      Total: 15 bytes
-
-    Falls back to smaller header sizes if 15-byte doesn't work.
+    Try to read a 15-byte entry header at the given offset.
+    Returns (type, block_id, content_len, timestamp_ms, flags) or None.
     """
-    if len(data) < 5:
+    if offset + ENTRY_HEADER_SIZE > len(data):
         return None
 
-    frame_type = data[0]
-    type_name = {1: "chunk", 2: "keyframe"}.get(frame_type, "unknown")
+    entry_type = data[offset]
+    if entry_type not in (CHUNK_TYPE, KEYFRAME_TYPE):
+        return None
 
-    # Try 15-byte header: [type:1][seq:4][len:4][time:4][flags:2]
-    if len(data) >= 15:
-        seq = struct.unpack_from("<I", data, 1)[0]
-        content_len = struct.unpack_from("<I", data, 5)[0]
-        time_field = struct.unpack_from("<I", data, 9)[0]
-        flags = struct.unpack_from("<H", data, 13)[0]
+    block_id = struct.unpack_from("<I", data, offset + 1)[0]
+    content_len = struct.unpack_from("<I", data, offset + 5)[0]
+    timestamp_ms = struct.unpack_from("<I", data, offset + 9)[0]
+    flags = struct.unpack_from("<H", data, offset + 13)[0]
 
-        expected_total = 15 + content_len
-        if abs(expected_total - len(data)) <= 8:
-            return FrameHeader(
-                frame_type=frame_type,
-                frame_type_name=type_name,
-                content_length=content_len,
-                header_size=15,
-                extra_fields={"seq": seq, "time_ms": time_field, "flags": flags},
-            )
+    return entry_type, block_id, content_len, timestamp_ms, flags
 
-    # Try 13-byte header: [type:1][seq:4][len:4][time:4]
-    if len(data) >= 13:
-        seq = struct.unpack_from("<I", data, 1)[0]
-        content_len = struct.unpack_from("<I", data, 5)[0]
-        time_field = struct.unpack_from("<I", data, 9)[0]
 
-        expected_total = 13 + content_len
-        if abs(expected_total - len(data)) <= 8:
-            return FrameHeader(
-                frame_type=frame_type,
-                frame_type_name=type_name,
-                content_length=content_len,
-                header_size=13,
-                extra_fields={"seq": seq, "time_ms": time_field},
-            )
+def _validate_entry(entry_type: int, block_id: int, content_len: int,
+                    timestamp_ms: int, remaining: int,
+                    prev_entry: PayloadEntry | None) -> bool:
+    """Heuristic validation of an entry header."""
+    # Content must fit in remaining data
+    if content_len > remaining - ENTRY_HEADER_SIZE:
+        return False
 
-    # Try 9-byte header: [type:1][seq:4][len:4]
-    if len(data) >= 9:
-        seq = struct.unpack_from("<I", data, 1)[0]
-        content_len = struct.unpack_from("<I", data, 5)[0]
+    # Reasonable content size (0 to 10MB)
+    if content_len > 10_000_000:
+        return False
 
-        expected_total = 9 + content_len
-        if abs(expected_total - len(data)) <= 8:
-            return FrameHeader(
-                frame_type=frame_type,
-                frame_type_name=type_name,
-                content_length=content_len,
-                header_size=9,
-                extra_fields={"seq": seq},
-            )
+    # Game time should be reasonable (0 to 120 minutes = 7,200,000 ms)
+    if timestamp_ms > 7_200_000:
+        return False
 
-    # No header — treat entire frame as content
-    return FrameHeader(
-        frame_type=0,
-        frame_type_name="raw",
-        content_length=len(data),
-        header_size=0,
-        extra_fields={},
+    # Block IDs should be reasonable (0 to 500)
+    if block_id > 500:
+        return False
+
+    # If we have a previous entry, timestamps should not decrease too much
+    if prev_entry is not None:
+        # Allow same or increasing time (keyframes can share timestamps with chunks)
+        if timestamp_ms < prev_entry.timestamp_ms - 60000:
+            return False
+
+    return True
+
+
+def parse_payload_stream(frames: list[bytes]) -> PayloadParseResult:
+    """
+    Concatenate decompressed frames and parse the payload stream into
+    chunk/keyframe entries.
+
+    Args:
+        frames: List of decompressed zstd frame byte strings.
+
+    Returns:
+        PayloadParseResult with extracted entries.
+    """
+    # Concatenate all frames into one stream
+    stream = b"".join(frames)
+    total_size = len(stream)
+
+    entries: list[PayloadEntry] = []
+    errors: list[str] = []
+    pos = 0
+
+    while pos < total_size - ENTRY_HEADER_SIZE:
+        hdr = _read_entry_header(stream, pos)
+
+        if hdr is None:
+            # Not a valid header at this position — scan forward
+            # Look for next type byte (0x01 or 0x02)
+            found = False
+            scan_start = pos
+            for scan_pos in range(pos + 1, min(pos + 1024, total_size)):
+                if stream[scan_pos] in (CHUNK_TYPE, KEYFRAME_TYPE):
+                    test_hdr = _read_entry_header(stream, scan_pos)
+                    if test_hdr is not None:
+                        remaining = total_size - scan_pos
+                        prev = entries[-1] if entries else None
+                        if _validate_entry(*test_hdr, remaining, prev):
+                            skipped = scan_pos - pos
+                            if skipped > 0:
+                                errors.append(f"Skipped {skipped}B at offset {pos}")
+                            pos = scan_pos
+                            found = True
+                            break
+
+            if not found:
+                # No valid header found in next 1KB — we're lost
+                # Try jumping further
+                errors.append(f"Lost sync at offset {pos}, scanning...")
+                pos += 1
+                continue
+
+            # Re-read header at new position
+            hdr = _read_entry_header(stream, pos)
+            if hdr is None:
+                pos += 1
+                continue
+
+        entry_type, block_id, content_len, timestamp_ms, flags = hdr
+        remaining = total_size - pos
+
+        if not _validate_entry(entry_type, block_id, content_len,
+                               timestamp_ms, remaining,
+                               entries[-1] if entries else None):
+            pos += 1
+            continue
+
+        # Extract content
+        content_start = pos + ENTRY_HEADER_SIZE
+        content_end = content_start + content_len
+        content = stream[content_start:content_end]
+
+        entries.append(PayloadEntry(
+            entry_type=entry_type,
+            block_id=block_id,
+            content_length=content_len,
+            timestamp_ms=timestamp_ms,
+            flags=flags,
+            content=content,
+            stream_offset=pos,
+        ))
+
+        pos = content_end
+
+    bytes_consumed = sum(ENTRY_HEADER_SIZE + e.content_length for e in entries)
+
+    return PayloadParseResult(
+        entries=entries,
+        total_stream_size=total_size,
+        bytes_consumed=bytes_consumed,
+        errors=errors,
     )
 
 
-# ── Packet stream parsing ────────────────────────────────────────────
+# ── Inner packet parsing (experimental) ──────────────────────────────
 
 
-def _parse_packet_stream(data: bytes, start_offset: int = 0) -> tuple[list[RawPacket], int, list[str]]:
+@dataclass
+class RawPacket:
+    """A single game packet extracted from chunk content."""
+    time_delta: int       # time offset byte
+    time_abs: float       # absolute time (from 0xFF marker), -1 if relative
+    channel: int          # channel byte (& 0x7F)
+    size: int             # payload size
+    data: bytes           # raw payload
+    offset: int           # offset within chunk content
+
+
+def parse_chunk_packets(content: bytes) -> tuple[list[RawPacket], int, list[str]]:
     """
-    Parse a batched packet stream using the LoL replay format.
+    Attempt to parse batched ENet packets from chunk content.
 
-    Format per packet (from community RE):
-      time_delta: u8
-        - If 0xFF: next 4 bytes are absolute time as f32 LE
-        - Otherwise: relative time in game ticks
-      channel: u8
-        - If bit 7 set: channel = (channel & 0x7F), size = next u8
-        - If bit 7 clear: size = next u32 LE (or u16 LE in some versions)
-      payload: bytes[size]
+    LoL replay packet format (from community RE):
+      [time_delta: u8]  (0xFF = absolute time follows as f32)
+      [channel:    u8]  (bit 7 set → short packet, size in next u8)
+                        (bit 7 clear → long packet, size in next u32 LE)
+      [payload:    N B]
 
     Returns (packets, bytes_consumed, errors).
     """
@@ -173,241 +262,181 @@ def _parse_packet_stream(data: bytes, start_offset: int = 0) -> tuple[list[RawPa
     errors: list[str] = []
     pos = 0
 
-    while pos < len(data) - 2:
+    while pos < len(content) - 2:
         pkt_start = pos
 
         # Time delta
-        time_delta = data[pos]
+        time_delta = content[pos]
         pos += 1
         time_abs = -1.0
 
         if time_delta == 0xFF:
-            if pos + 4 > len(data):
-                errors.append(f"truncated abs time at offset {pkt_start}")
+            if pos + 4 > len(content):
                 break
-            time_abs = struct.unpack_from("<f", data, pos)[0]
+            time_abs = struct.unpack_from("<f", content, pos)[0]
             pos += 4
 
-        # Channel byte
-        if pos >= len(data):
-            errors.append(f"truncated channel at offset {pkt_start}")
+        # Channel
+        if pos >= len(content):
             break
-        channel_byte = data[pos]
+        channel_raw = content[pos]
         pos += 1
 
-        # Determine packet size based on channel encoding
-        short_packet = bool(channel_byte & 0x80)
-        channel = channel_byte & 0x7F
+        short = bool(channel_raw & 0x80)
+        channel = channel_raw & 0x7F
 
-        if short_packet:
-            # Short: 1-byte size
-            if pos >= len(data):
-                errors.append(f"truncated short size at offset {pkt_start}")
+        # Size
+        if short:
+            if pos >= len(content):
                 break
-            pkt_size = data[pos]
+            pkt_size = content[pos]
             pos += 1
         else:
-            # Long: try u32 LE
-            if pos + 4 > len(data):
-                # Maybe u16?
-                if pos + 2 <= len(data):
-                    pkt_size = struct.unpack_from("<H", data, pos)[0]
-                    pos += 2
-                else:
-                    errors.append(f"truncated long size at offset {pkt_start}")
-                    break
-            else:
-                pkt_size = struct.unpack_from("<I", data, pos)[0]
-                pos += 4
-
-        # Sanity check size
-        if pkt_size > len(data) - pos:
-            # Size too large — maybe wrong format. Try u16 instead of u32.
-            if not short_packet and pkt_size > 65535:
-                pos = pkt_start + 1 + (5 if time_delta == 0xFF else 0) + 1
-                if pos + 2 <= len(data):
-                    pkt_size = struct.unpack_from("<H", data, pos)[0]
-                    pos += 2
-                    if pkt_size > len(data) - pos:
-                        errors.append(f"size overflow ({pkt_size}) at offset {pkt_start}")
-                        break
-                else:
-                    errors.append(f"size overflow at offset {pkt_start}")
-                    break
-            else:
-                errors.append(f"size overflow ({pkt_size}) at offset {pkt_start}")
+            if pos + 4 > len(content):
                 break
+            pkt_size = struct.unpack_from("<I", content, pos)[0]
+            pos += 4
 
-        if pkt_size == 0:
-            # Zero-length packets can happen (keepalive, etc.)
-            packets.append(RawPacket(
-                time_delta=time_delta, time_abs=time_abs,
-                channel=channel, size=0, data=b"",
-                offset=start_offset + pkt_start,
-            ))
-            continue
-
-        # Extract payload
-        pkt_data = data[pos : pos + pkt_size]
-        pos += pkt_size
-
-        packets.append(RawPacket(
-            time_delta=time_delta, time_abs=time_abs,
-            channel=channel, size=pkt_size, data=pkt_data,
-            offset=start_offset + pkt_start,
-        ))
-
-    return packets, pos, errors
-
-
-def _parse_packet_stream_alt(data: bytes, start_offset: int = 0) -> tuple[list[RawPacket], int, list[str]]:
-    """
-    Alternative parser: no time delta, just [channel:u8][size:u16 LE][data].
-    Some replay formats use this simpler encoding.
-    """
-    packets: list[RawPacket] = []
-    errors: list[str] = []
-    pos = 0
-
-    while pos < len(data) - 3:
-        pkt_start = pos
-        channel = data[pos]
-        pos += 1
-        pkt_size = struct.unpack_from("<H", data, pos)[0]
-        pos += 2
-
-        if pkt_size > len(data) - pos or pkt_size > 65535:
-            errors.append(f"size overflow ({pkt_size}) at offset {pkt_start}")
+        # Validate
+        if pkt_size > len(content) - pos:
+            errors.append(f"size overflow ({pkt_size}) at content offset {pkt_start}")
             break
 
-        pkt_data = data[pos : pos + pkt_size]
+        payload = content[pos:pos + pkt_size]
         pos += pkt_size
 
         packets.append(RawPacket(
-            time_delta=0, time_abs=-1.0,
-            channel=channel, size=pkt_size, data=pkt_data,
-            offset=start_offset + pkt_start,
+            time_delta=time_delta,
+            time_abs=time_abs,
+            channel=channel,
+            size=pkt_size,
+            data=payload,
+            offset=pkt_start,
         ))
 
     return packets, pos, errors
 
 
-# ── Main parse function ──────────────────────────────────────────────
+# ── Analysis / display helpers ────────────────────────────────────────
 
 
-def parse_frame(data: bytes, frame_index: int = 0) -> ParsedFrame:
-    """
-    Parse a single decompressed frame into header + packets.
+def print_payload_summary(result: PayloadParseResult):
+    """Print a summary of the parsed payload."""
+    print(f"\n{'='*70}")
+    print(f"Payload stream: {result.total_stream_size:,} bytes")
+    print(f"Entries found:  {len(result.entries)} "
+          f"({result.n_chunks} chunks + {result.n_keyframes} keyframes)")
+    print(f"Bytes consumed: {result.bytes_consumed:,} / {result.total_stream_size:,} "
+          f"({result.parse_ratio:.1%})")
+    print(f"Errors:         {len(result.errors)}")
+    print(f"{'='*70}")
 
-    Tries multiple parsing strategies and returns the one that
-    successfully parses the most bytes.
-    """
-    header = _try_header(data)
-    if header is None:
-        return ParsedFrame(
-            index=frame_index, header=FrameHeader(0, "error", 0, 0),
-            packets=[], raw_size=len(data), bytes_parsed=0,
-            errors=["Frame too small to parse"],
-        )
+    if not result.entries:
+        print("  No entries found!")
+        if result.errors:
+            print(f"\n  First errors:")
+            for e in result.errors[:10]:
+                print(f"    {e}")
+        return
 
-    content = data[header.header_size:]
+    # Entry table
+    print(f"\n{'─'*80}")
+    print(f"  {'#':>4s} | {'Type':<8s} | {'BlkID':>5s} | {'Time':>10s} | "
+          f"{'Content':>10s} | {'Flags':>5s} | {'Offset':>10s}")
+    print(f"{'─'*80}")
 
-    # Try strategy A: time_delta + channel (with short/long size)
-    pkts_a, consumed_a, errs_a = _parse_packet_stream(content)
-    # Try strategy B: simple channel + u16 size
-    pkts_b, consumed_b, errs_b = _parse_packet_stream_alt(content)
+    for i, e in enumerate(result.entries):
+        time_str = f"{e.timestamp_ms // 60000}:{(e.timestamp_ms % 60000) // 1000:02d}.{e.timestamp_ms % 1000:03d}"
+        print(f"  {i:>4d} | {e.type_name:<8s} | {e.block_id:>5d} | {time_str:>10s} | "
+              f"{e.content_length:>8,} B | {e.flags:>5d} | {e.stream_offset:>8,}")
 
-    # Pick the strategy that parsed more data successfully
-    if consumed_a >= consumed_b and len(pkts_a) > 0:
-        return ParsedFrame(
-            index=frame_index, header=header,
-            packets=pkts_a, raw_size=len(data),
-            bytes_parsed=consumed_a, errors=errs_a,
-        )
-    elif len(pkts_b) > 0:
-        return ParsedFrame(
-            index=frame_index, header=header,
-            packets=pkts_b, raw_size=len(data),
-            bytes_parsed=consumed_b, errors=errs_b,
-        )
-    else:
-        return ParsedFrame(
-            index=frame_index, header=header,
-            packets=[], raw_size=len(data),
-            bytes_parsed=0,
-            errors=errs_a + errs_b + ["No parsing strategy succeeded"],
-        )
+    print(f"{'─'*80}")
 
+    # Time range
+    times = [e.timestamp_ms for e in result.entries]
+    print(f"\n  Time range: {min(times)/1000:.1f}s → {max(times)/1000:.1f}s "
+          f"({(max(times) - min(times)) / 60000:.1f} min)")
 
-def parse_all_frames(frames: list[bytes]) -> list[ParsedFrame]:
-    """Parse all decompressed frames."""
-    return [parse_frame(f, i) for i, f in enumerate(frames)]
+    # Chunk vs keyframe size comparison
+    chunk_sizes = [e.content_length for e in result.entries if e.entry_type == CHUNK_TYPE]
+    kf_sizes = [e.content_length for e in result.entries if e.entry_type == KEYFRAME_TYPE]
 
+    if chunk_sizes:
+        print(f"\n  Chunks ({len(chunk_sizes)}): "
+              f"min={min(chunk_sizes):,}  max={max(chunk_sizes):,}  "
+              f"avg={sum(chunk_sizes)//len(chunk_sizes):,}  total={sum(chunk_sizes):,}")
+    if kf_sizes:
+        print(f"  Keyframes ({len(kf_sizes)}): "
+              f"min={min(kf_sizes):,}  max={max(kf_sizes):,}  "
+              f"avg={sum(kf_sizes)//len(kf_sizes):,}  total={sum(kf_sizes):,}")
 
-# ── Analysis helpers ─────────────────────────────────────────────────
+    # Content hex preview of first entry
+    if result.entries:
+        e = result.entries[0]
+        print(f"\n── Hex preview: entry 0 ({e.type_name} #{e.block_id}) first 128B ──")
+        data = e.content[:128]
+        for off in range(0, len(data), 16):
+            chunk = data[off:off + 16]
+            hex_part = " ".join(f"{b:02x}" for b in chunk)
+            ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            print(f"  {off:04x}: {hex_part:<48s} {ascii_part}")
 
+    # Also preview a keyframe if available
+    kf_entries = [e for e in result.entries if e.entry_type == KEYFRAME_TYPE]
+    if kf_entries:
+        e = kf_entries[0]
+        print(f"\n── Hex preview: first keyframe ({e.type_name} #{e.block_id}) first 128B ──")
+        data = e.content[:128]
+        for off in range(0, len(data), 16):
+            chunk = data[off:off + 16]
+            hex_part = " ".join(f"{b:02x}" for b in chunk)
+            ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            print(f"  {off:04x}: {hex_part:<48s} {ascii_part}")
 
-def frame_summary(parsed: ParsedFrame) -> str:
-    """One-line summary of a parsed frame."""
-    h = parsed.header
-    n = len(parsed.packets)
-    ratio = parsed.parse_ratio
-    sizes = [p.size for p in parsed.packets] if parsed.packets else [0]
-    channels = set(p.channel for p in parsed.packets)
-    return (
-        f"Frame {parsed.index:>3d} | {h.frame_type_name:<8s} | "
-        f"{parsed.raw_size:>8,} B | "
-        f"{n:>5d} pkts | "
-        f"parsed {ratio:.0%} | "
-        f"ch={sorted(channels)} | "
-        f"sizes: {min(sizes)}-{max(sizes)}"
-    )
-
-
-def channel_breakdown(frames: list[ParsedFrame]) -> dict[int, dict]:
-    """Aggregate packet stats by channel across all frames."""
-    stats: dict[int, dict] = {}
-    for f in frames:
-        for p in f.packets:
-            ch = p.channel
-            if ch not in stats:
-                stats[ch] = {"count": 0, "total_bytes": 0, "sizes": []}
-            stats[ch]["count"] += 1
-            stats[ch]["total_bytes"] += p.size
-            stats[ch]["sizes"].append(p.size)
-
-    for ch, s in stats.items():
-        sizes = s["sizes"]
-        s["min_size"] = min(sizes) if sizes else 0
-        s["max_size"] = max(sizes) if sizes else 0
-        s["avg_size"] = sum(sizes) // len(sizes) if sizes else 0
-        del s["sizes"]  # don't keep raw list
-
-    return dict(sorted(stats.items()))
+    # Errors
+    if result.errors:
+        print(f"\n── Parse errors (first 10 of {len(result.errors)}) ──")
+        for e in result.errors[:10]:
+            print(f"  {e}")
 
 
-def packet_type_histogram(frames: list[ParsedFrame]) -> dict[int, int]:
-    """
-    Count packets by their first byte (rough "packet type" proxy).
-    The first byte of packet data is often the message type ID.
-    """
-    hist: dict[int, int] = {}
-    for f in frames:
-        for p in f.packets:
-            if p.data:
-                ptype = p.data[0]
-                hist[ptype] = hist.get(ptype, 0) + 1
-    return dict(sorted(hist.items(), key=lambda x: -x[1]))
+def try_inner_packet_parse(result: PayloadParseResult, max_entries: int = 3):
+    """Try parsing packets from the first few chunk entries."""
+    chunks = [e for e in result.entries if e.entry_type == CHUNK_TYPE]
+    if not chunks:
+        print("\n  No chunks to parse packets from.")
+        return
 
+    print(f"\n{'='*70}")
+    print(f"Attempting inner packet parse on first {min(max_entries, len(chunks))} chunks...")
+    print(f"{'='*70}")
 
-def packet_type_histogram_u16(frames: list[ParsedFrame]) -> dict[int, int]:
-    """
-    Count packets by first 2 bytes as u16 LE (some packet types use 2-byte IDs).
-    """
-    hist: dict[int, int] = {}
-    for f in frames:
-        for p in f.packets:
-            if len(p.data) >= 2:
-                ptype = struct.unpack_from("<H", p.data, 0)[0]
-                hist[ptype] = hist.get(ptype, 0) + 1
-    return dict(sorted(hist.items(), key=lambda x: -x[1]))
+    for e in chunks[:max_entries]:
+        pkts, consumed, errs = parse_chunk_packets(e.content)
+        ratio = consumed / len(e.content) if e.content else 0
+
+        print(f"\n  Chunk #{e.block_id} (t={e.time_sec:.1f}s, {len(e.content):,}B):")
+        print(f"    Packets: {len(pkts)}, consumed: {consumed:,}/{len(e.content):,} ({ratio:.0%})")
+
+        if errs:
+            print(f"    Errors: {errs[:3]}")
+
+        if pkts:
+            # Show first few packets
+            channels = Counter(p.channel for p in pkts)
+            print(f"    Channels: {dict(channels.most_common(10))}")
+            print(f"    First 5 packets:")
+            for i, p in enumerate(pkts[:5]):
+                time_str = f"t={p.time_abs:.3f}s" if p.time_abs >= 0 else f"dt={p.time_delta}"
+                hex_pre = p.data[:32].hex() if p.data else "(empty)"
+                print(f"      [{i}] {time_str:<14s} ch={p.channel} size={p.size:>5d}  {hex_pre}")
+
+    # Byte frequency analysis on first chunk content
+    if chunks:
+        content = chunks[0].content
+        freq = Counter(content)
+        top = freq.most_common(10)
+        print(f"\n── Byte frequency (chunk 0, {len(content):,}B) ──")
+        for byte_val, count in top:
+            pct = count / len(content) * 100
+            print(f"  0x{byte_val:02X} ({byte_val:>3d}): {count:>6,} ({pct:.1f}%)")
