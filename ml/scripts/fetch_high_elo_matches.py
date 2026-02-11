@@ -275,7 +275,19 @@ def main():
     api_key = args.api_key
     if not api_key:
         import os
-        api_key = os.environ.get("RIOT_API_KEY", "")
+        # Try loading from .env file
+        for env_path in ["backend/.env", ".env"]:
+            if os.path.exists(env_path):
+                with open(env_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("RIOT_API_KEY=") and not line.startswith("#"):
+                            api_key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            break
+            if api_key:
+                break
+        if not api_key:
+            api_key = os.environ.get("RIOT_API_KEY", "")
 
     if not api_key:
         print("Error: Set --api-key or RIOT_API_KEY environment variable")
