@@ -370,10 +370,14 @@ def step_replays(client: RiotAPIClient, output_dir: Path, max_replays: int):
             if total_downloaded >= max_replays:
                 break
 
-            # Extract filename from URL or generate one
-            fname = url.split("/")[-1] if "/" in url else f"{puuid}_{total_downloaded}.rofl"
+            # Extract match ID from URL path, ignore query params
+            url_path = url.split("?")[0]
+            fname = url_path.split("/")[-1]
             if not fname.endswith(".rofl"):
                 fname += ".rofl"
+            # Fallback if filename is still weird
+            if len(fname) > 200:
+                fname = f"{puuid[:16]}_{total_downloaded}.rofl"
             dest = replays_dir / fname
 
             if dest.exists():
@@ -427,7 +431,7 @@ def main():
     parser.add_argument("--matches-per-player", type=int, default=5)
     parser.add_argument("--output", type=str, default="./ml/data/raw/high_elo")
     parser.add_argument("--step", type=str, default="all",
-                        choices=["all", "players", "matchids", "download", "replays"],
+                        choices=["all", "players", "matchids", "download", "replays", "debug"],
                         help="Run a specific step (default: all)")
     args = parser.parse_args()
 
@@ -451,6 +455,89 @@ def main():
 
     if args.step == "replays":
         step_replays(client, output_dir, args.count)
+
+    if args.step == "debug":
+        step_debug(client, output_dir)
+
+
+def step_debug(client: RiotAPIClient, output_dir: Path):
+    """Debug: test each endpoint individually."""
+    import json as _json
+
+    match_ids_file = output_dir / "match_ids.json"
+    players_file = output_dir / "players.json"
+
+    print("=== DEBUG: Testing API endpoints ===\n")
+
+    # 1. Test league endpoint
+    print("1. League-v4 (get challengers)...")
+    url = f"https://{client.platform}.api.riotgames.com/lol/league/v4/challengerleagues/by-queue/RANKED_SOLO_5x5"
+    resp = client.client.get(url, headers=client.headers)
+    print(f"   URL: {url}")
+    print(f"   Status: {resp.status_code}")
+    print(f"   Rate headers: {dict((k,v) for k,v in resp.headers.items() if 'rate' in k.lower())}")
+    print()
+
+    # 2. Get a PUUID
+    puuid = None
+    if players_file.exists():
+        players = _json.loads(players_file.read_text())
+        puuid = players[0].get("puuid")
+        print(f"2. Using PUUID from players.json: {puuid[:20]}...")
+    if not puuid:
+        print("2. No PUUID available, skipping remaining tests")
+        return
+
+    # 3. Test match list endpoint
+    print("\n3. Match-v5 match list (by puuid)...")
+    url = f"https://{client.region}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?count=3&type=ranked"
+    resp = client.client.get(url, headers=client.headers)
+    print(f"   URL: {url}")
+    print(f"   Status: {resp.status_code}")
+    print(f"   Body: {resp.text[:300]}")
+    print()
+
+    match_ids = []
+    if resp.status_code == 200:
+        match_ids = resp.json()
+
+    # Also try from saved match_ids.json
+    if not match_ids and match_ids_file.exists():
+        data = _json.loads(match_ids_file.read_text())
+        match_ids = data.get("match_ids", [])[:3]
+        print(f"   (Using saved match IDs instead: {match_ids})")
+
+    if not match_ids:
+        print("   No match IDs to test with")
+        return
+
+    # 4. Test match data endpoint
+    test_id = match_ids[0]
+    print(f"\n4. Match-v5 match data ({test_id})...")
+    url = f"https://{client.region}.api.riotgames.com/lol/match/v5/matches/{test_id}"
+    resp = client.client.get(url, headers=client.headers)
+    print(f"   URL: {url}")
+    print(f"   Status: {resp.status_code}")
+    print(f"   Headers: {dict((k,v) for k,v in resp.headers.items() if 'rate' in k.lower() or 'retry' in k.lower())}")
+    print(f"   Body: {resp.text[:500]}")
+    print()
+
+    # 5. Test timeline endpoint
+    print(f"\n5. Match-v5 timeline ({test_id})...")
+    url = f"https://{client.region}.api.riotgames.com/lol/match/v5/matches/{test_id}/timeline"
+    resp = client.client.get(url, headers=client.headers)
+    print(f"   URL: {url}")
+    print(f"   Status: {resp.status_code}")
+    print(f"   Body: {resp.text[:500]}")
+    print()
+
+    # 6. Try multiple match IDs to see if it's specific matches
+    print("\n6. Testing first 5 match IDs...")
+    for mid in match_ids[:5]:
+        url = f"https://{client.region}.api.riotgames.com/lol/match/v5/matches/{mid}"
+        resp = client.client.get(url, headers=client.headers)
+        print(f"   {mid} → {resp.status_code}")
+        time.sleep(0.1)
 
 
 if __name__ == "__main__":
