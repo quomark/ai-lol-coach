@@ -52,6 +52,13 @@ def mode_inspect(filepath: str):
     print(f"  lastKeyFrameId:    {meta.get('lastKeyFrameId')}")
     print(f"  All keys:          {sorted(meta.keys())}")
 
+    # Zstd frame count
+    try:
+        n_frames = p.payload_frame_count()
+        print(f"  Zstd frames in payload: {n_frames}")
+    except Exception:
+        pass
+
     # Stats per player
     stats_raw = meta.get("statsJson", "[]")
     if isinstance(stats_raw, str):
@@ -62,40 +69,100 @@ def mode_inspect(filepath: str):
     else:
         stats_list = stats_raw if isinstance(stats_raw, list) else []
 
+    # ── Coaching-relevant stat keys (show for first player) ──
+    COACHING_KEYS = [
+        # Identity
+        "NAME", "SKIN", "TEAM", "WIN", "ID",
+        "INDIVIDUAL_POSITION", "TEAM_POSITION",
+        # Core
+        "CHAMPIONS_KILLED", "NUM_DEATHS", "ASSISTS", "LEVEL", "EXP",
+        "GOLD_EARNED", "GOLD_SPENT", "MINIONS_KILLED",
+        "NEUTRAL_MINIONS_KILLED", "NEUTRAL_MINIONS_KILLED_YOUR_JUNGLE",
+        "NEUTRAL_MINIONS_KILLED_ENEMY_JUNGLE",
+        # Damage
+        "TOTAL_DAMAGE_DEALT", "TOTAL_DAMAGE_DEALT_TO_CHAMPIONS",
+        "PHYSICAL_DAMAGE_DEALT_TO_CHAMPIONS", "MAGIC_DAMAGE_DEALT_TO_CHAMPIONS",
+        "TRUE_DAMAGE_DEALT_TO_CHAMPIONS", "TOTAL_DAMAGE_TAKEN",
+        "PHYSICAL_DAMAGE_TAKEN", "MAGIC_DAMAGE_TAKEN", "TRUE_DAMAGE_TAKEN",
+        "TOTAL_DAMAGE_DEALT_TO_BUILDINGS", "TOTAL_DAMAGE_DEALT_TO_OBJECTIVES",
+        "LARGEST_CRITICAL_STRIKE",
+        # Combat
+        "DOUBLE_KILLS", "TRIPLE_KILLS", "QUADRA_KILLS", "PENTA_KILLS",
+        "KILLING_SPREES", "LARGEST_KILLING_SPREE", "LARGEST_MULTI_KILL",
+        "TIME_CCING_OTHERS", "TOTAL_TIME_CROWD_CONTROL_DEALT",
+        "TOTAL_HEAL", "TOTAL_UNITS_HEALED",
+        # Vision
+        "WARD_PLACED", "WARD_KILLED", "SIGHT_WARDS_BOUGHT_IN_GAME",
+        "VISION_WARDS_BOUGHT_IN_GAME", "VISION_SCORE",
+        # Objectives
+        "DRAGON_KILLS", "BARON_KILLS", "RIFT_HERALD_KILLS",
+        "TURRET_KILLED", "TURRET_TAKEDOWNS", "HQ_KILLED",
+        "BARRACKS_KILLED", "ATAKHAN_KILLS",
+        # Economy / Items
+        "ITEM0", "ITEM1", "ITEM2", "ITEM3", "ITEM4", "ITEM5", "ITEM6",
+        "ITEMS_PURCHASED", "CONSUMABLES_PURCHASED",
+        "KEYSTONE_ID",
+        # Survival
+        "LONGEST_TIME_SPENT_LIVING", "TOTAL_TIME_SPENT_DEAD",
+        # Game outcome
+        "GAME_ENDED_IN_SURRENDER", "GAME_ENDED_IN_EARLY_SURRENDER",
+        "FRIENDLY_TURRET_LOST", "FRIENDLY_HQ_LOST",
+    ]
+
     if stats_list:
         print(f"\n── Player Stats ({len(stats_list)} players) ──")
+
+        # Show ALL coaching-relevant keys for player 1
+        p1 = stats_list[0] if isinstance(stats_list[0], dict) else {}
+        print(f"\n  [Player 1] — All coaching-relevant stats:")
+        for k in COACHING_KEYS:
+            if k in p1:
+                print(f"    {k}: {p1[k]}")
+
+        # Summary table for all players
+        print(f"\n  ┌─────┬──────────────────┬──────┬───┬───┬───┬───────┬─────┬──────┐")
+        print(f"  │  #  │ Champion (SKIN)   │ Pos  │ K │ D │ A │ Gold  │  CS │ Win? │")
+        print(f"  ├─────┼──────────────────┼──────┼───┼───┼───┼───────┼─────┼──────┤")
         for i, ps in enumerate(stats_list):
-            # Show first 10 keys as sample
-            keys = sorted(ps.keys()) if isinstance(ps, dict) else []
-            print(f"  [Player {i+1}]  {len(keys)} stat keys")
-            if keys:
-                print(f"    Sample keys: {keys[:12]}")
-                # Try to find some recognisable stats
-                for prefix in ("CHAMPIONS_KILLED", "NUM_DEATHS", "ASSISTS",
-                               "GOLD_EARNED", "MINIONS_KILLED"):
-                    if prefix in ps:
-                        print(f"    {prefix}: {ps[prefix]}")
+            if not isinstance(ps, dict):
+                continue
+            skin = ps.get("SKIN", ps.get("skin", "?"))
+            pos = ps.get("INDIVIDUAL_POSITION", ps.get("TEAM_POSITION", "?"))
+            k = ps.get("CHAMPIONS_KILLED", "?")
+            d = ps.get("NUM_DEATHS", "?")
+            a = ps.get("ASSISTS", "?")
+            gold = ps.get("GOLD_EARNED", "?")
+            cs = ps.get("MINIONS_KILLED", "?")
+            win = ps.get("WIN", "?")
+            hq_lost = ps.get("FRIENDLY_HQ_LOST", "?")
+            win_display = win if win != "?" else ("L" if hq_lost == "1" else "W" if hq_lost == "0" else "?")
+            print(f"  │ {i+1:>3} │ {str(skin):<16s} │ {str(pos):<4s} │{str(k):>2s} │{str(d):>2s} │{str(a):>2s} │{str(gold):>6s} │{str(cs):>4s} │ {str(win_display):<4s} │")
+        print(f"  └─────┴──────────────────┴──────┴───┴───┴───┴───────┴─────┴──────┘")
+
+        # Show all unique stat key categories (filter out seasonal/skin junk)
+        all_keys = sorted(p1.keys())
+        gameplay_keys = [k for k in all_keys if not k.startswith(("2026_", "Event_", "Missions_",
+                         "ActMission_", "DemonsHand_", "HoL_"))]
+        print(f"\n  All gameplay stat keys ({len(gameplay_keys)}/{len(all_keys)} non-event):")
+        for k in gameplay_keys:
+            print(f"    {k}: {p1[k]}")
     else:
         print(f"\n  No player stats found in statsJson")
 
-    # Print the full raw metadata (pretty, truncated)
-    print(f"\n── Raw Metadata (first 5000 chars) ──")
-    pretty = json.dumps(meta, indent=2, ensure_ascii=False)
-    print(pretty[:5000])
-    if len(pretty) > 5000:
-        print(f"  ... ({len(pretty)} total chars)")
-
-    # Optionally try decompressing payload
+    # Payload decompression
     try:
         payload = p.decompress_payload()
         print(f"\n── Decompressed Payload ──")
         print(f"  Size: {len(payload):,} bytes ({len(payload)/1024/1024:.1f} MB)")
         print(f"  First 200 bytes (hex): {payload[:200].hex()}")
         # Look for recognizable structures
-        for marker in (b"KeyFrame", b"Chunk", b"gameData", b"player"):
+        for marker in (b"KeyFrame", b"Chunk", b"gameData", b"player", b"position",
+                       b"champion", b"spell", b"item", b"gold", b"kill", b"death"):
             idx = payload.find(marker)
             if idx >= 0:
+                ctx = payload[max(0, idx-20):idx+50]
                 print(f"  Found '{marker.decode()}' at offset {idx}")
+                print(f"    Context: {ctx.hex()}")
     except ImportError:
         print(f"\n  (Install zstandard to decompress payload: pip install zstandard)")
     except Exception as e:

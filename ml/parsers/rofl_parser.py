@@ -172,14 +172,67 @@ class ROFLParser:
         return data[hdr.payload_offset : hdr.metadata_offset]
 
     def decompress_payload(self) -> bytes:
-        """Decompress game payload. Requires ``zstandard``."""
+        """
+        Decompress game payload (multi-frame zstd).
+
+        The payload contains many zstd frames (one per chunk/keyframe)
+        possibly interleaved with non-zstd binary headers.
+        We decompress greedily and tolerate errors at frame boundaries.
+
+        Requires ``zstandard``.
+        """
         if not HAS_ZSTD:
             raise ImportError("pip install zstandard")
 
         raw = self.get_compressed_payload()
         dctx = zstandard.ZstdDecompressor()
+
+        # Approach 1: stream_reader with chunked reads (handles multi-frame)
+        buf = io.BytesIO()
         reader = dctx.stream_reader(io.BytesIO(raw))
-        return reader.read()
+        try:
+            while True:
+                chunk = reader.read(65536)
+                if not chunk:
+                    break
+                buf.write(chunk)
+        except zstandard.ZstdError:
+            pass  # hit non-zstd data after valid frames — expected
+
+        if buf.tell() > 0:
+            return buf.getvalue()
+
+        # Approach 2: decompress individual frames by scanning for magic
+        frames: list[bytes] = []
+        pos = 0
+        while pos < len(raw) - 4:
+            idx = raw.find(ZSTD_MAGIC, pos)
+            if idx < 0:
+                break
+            try:
+                frame = dctx.decompress(raw[idx:], max_output_size=50_000_000)
+                frames.append(frame)
+            except zstandard.ZstdError:
+                pass
+            pos = idx + 4
+
+        if frames:
+            return b"".join(frames)
+
+        raise ValueError("No decompressible zstd frames in payload")
+
+    def payload_frame_count(self) -> int:
+        """Count zstd frame magic occurrences in the payload."""
+        raw = self.get_compressed_payload()
+        count = 0
+        pos = 0
+        while True:
+            idx = raw.find(ZSTD_MAGIC, pos)
+            if idx < 0:
+                break
+            count += 1
+            pos = idx + 4
+        return count
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
