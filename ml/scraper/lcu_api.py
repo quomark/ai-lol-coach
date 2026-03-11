@@ -224,12 +224,22 @@ class LCUClient:
                 return True
         return False
 
-    def launch_replay_from_file(self, rofl_path: str) -> bool:
+    def launch_replay_from_file(
+        self,
+        rofl_path: str,
+        region: str = "NA1",
+        locale: str = "en_US",
+    ) -> bool:
         """
         Launch a local .rofl file.
 
+        Critical: Vanguard blocks the game exe from loading replays.
+        We must stop Vanguard before launch and restart it after.
+
+        Ref: https://www.xn--74qo087bi0eju4b.tw/2023/11/lolreplaybat.html
+
         Strategies (in order):
-          1. Direct game exe launch (op.gg style — most reliable)
+          1. Direct game exe launch (bat-script style — most reliable)
           2. LCU watch endpoint
           3. OS file handler (double-click equivalent)
         """
@@ -242,36 +252,58 @@ class LCUClient:
         stem = rofl.stem.replace(".replay", "")
         print(f"  [INFO] File: {rofl.name}")
 
-        # Strategy 1: Direct game executable launch (op.gg approach)
-        # This is the most reliable — bypasses LCU entirely
+        # Strategy 1: Direct game executable launch
+        # Must stop Vanguard first — it blocks League of Legends.exe from
+        # reading .rofl files when launched outside the client.
         game_exe, game_dir = self._find_game_exe()
         if game_exe:
             try:
+                if sys.platform == "win32":
+                    self._stop_vanguard()
+
                 env = os.environ.copy()
                 env["riot_launched"] = "true"
 
                 if sys.platform == "darwin":
-                    # Mac: ./LeagueofLegends.app/Contents/MacOS/LeagueofLegends
                     cmd = [
                         str(game_exe),
                         abs_path,
                         "-UseRads",
-                        f"-GameBaseDir={game_dir}",
+                        "-GameBaseDir=..",
                     ]
                 else:
-                    # Windows: League of Legends.exe
+                    # Windows — full flags from the Taiwanese bat script
                     cmd = [
                         str(game_exe),
                         abs_path,
-                        f"-GameBaseDir={game_dir}",
+                        "-GameBaseDir=..",
+                        f"-Region={region}",
+                        f"-PlatformID={region}",
+                        f"-Locale={locale}",
+                        "-SkipBuild",
+                        "-EnableCrashpad=true",
+                        "-EnableLNP",
+                        "-UseDX11=1:1",
+                        "-UseMetal=0:1",
+                        "-UseNewX3D",
+                        "-UseNewX3DFramebuffers",
                     ]
 
-                print(f"  [INFO] Direct launch: {' '.join(cmd[:2])}...")
+                print(f"  [INFO] Direct launch: {game_exe.name} {rofl.name}")
+                print(f"  [INFO] cwd={game_exe.parent}")
                 subprocess.Popen(cmd, cwd=str(game_exe.parent), env=env)
                 print(f"  [OK] Game process launched directly")
+
+                if sys.platform == "win32":
+                    # Wait a bit, then restart Vanguard
+                    time.sleep(5)
+                    self._start_vanguard()
+
                 return True
             except Exception as e:
                 print(f"  [WARN] Direct launch failed: {e}")
+                if sys.platform == "win32":
+                    self._start_vanguard()  # safety: always restart
 
         # Strategy 2: LCU watch endpoint (needs game ID in client's replay list)
         game_id = stem.replace("-", "_")
@@ -300,6 +332,25 @@ class LCUClient:
 
         print(f"  [FAIL] All launch strategies failed")
         return False
+
+    @staticmethod
+    def _stop_vanguard():
+        """Stop Riot Vanguard — it blocks the replay viewer."""
+        print("  [INFO] Stopping Vanguard...")
+        subprocess.run(["taskkill", "/IM", "vgtray.exe", "/F"],
+                        capture_output=True)
+        subprocess.run(["sc", "stop", "vgc"], capture_output=True)
+        subprocess.run(["sc", "stop", "vgk"], capture_output=True)
+        time.sleep(1)
+
+    @staticmethod
+    def _start_vanguard():
+        """Restart Riot Vanguard after replay launch."""
+        print("  [INFO] Restarting Vanguard...")
+        subprocess.run(["sc", "start", "vgc"], capture_output=True)
+        vgtray = Path(r"C:\Program Files\Riot Vanguard\vgtray.exe")
+        if vgtray.exists():
+            subprocess.Popen([str(vgtray)], creationflags=0x00000008)  # DETACHED_PROCESS
 
     def _find_game_exe(self) -> tuple[Path | None, str]:
         """
@@ -342,13 +393,32 @@ class LCUClient:
                 Path(os.path.expanduser("~/Riot Games/League of Legends/Game/League of Legends.exe")),
             ]
 
+            # Try registry (same method as the Taiwanese bat script)
+            try:
+                import winreg
+                key = winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\IntelliPoint\AppSpecific\League of Legends.exe",
+                )
+                reg_path, _ = winreg.QueryValueEx(key, "Path")
+                winreg.CloseKey(key)
+                # reg_path is like "C:\Riot Games\League of Legends\Game\League of Legends.exe"
+                if reg_path:
+                    win_candidates.insert(0, Path(reg_path))
+            except Exception:
+                pass
+
             # Try to get install path from LCU
-            install_dir = self._get("/lol-patch/v1/game-path")
-            if install_dir and isinstance(install_dir, str):
-                win_candidates.insert(0, Path(install_dir) / "League of Legends.exe")
+            try:
+                install_dir = self._get("/lol-patch/v1/game-path")
+                if install_dir and isinstance(install_dir, str):
+                    win_candidates.insert(0, Path(install_dir) / "League of Legends.exe")
+            except Exception:
+                pass
 
             # Try to find via running process
             try:
+                import psutil
                 for proc in psutil.process_iter(["name", "exe"]):
                     if proc.info["name"] and "LeagueClient" in proc.info["name"]:
                         client_dir = Path(proc.info["exe"]).parent
