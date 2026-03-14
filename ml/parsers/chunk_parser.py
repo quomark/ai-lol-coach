@@ -9,13 +9,19 @@ ROFL v2 frame format (confirmed from hex analysis):
     [field_b:   u32 ]  varies (chunk: often 520, keyframe: often 818)
     [flags:     u16 ]  0x0000 or 0x4000
 
-  After the header, the content contains batched game packets.
+  After the header, the content contains batched game blocks.
 
-  Inner packet format (partially confirmed):
-    [time_delta: u8]  time offset (0xFF = absolute time as f32 follows)
-    [channel:    u8]  ENet channel
-    [size:      u16]  payload length (LE)
-    [payload:    N ]  raw packet bytes
+  Inner block format (from Mowokuma/ROFL Rust parser):
+    [marker: u8]  bit flags controlling field encoding:
+      bit 7 (0x80): timestamp = delta (read u8 * 0.001s + acc) else absolute f32
+      bit 6 (0x40): packet_id = reuse previous, else read u16
+      bit 5 (0x20): param = delta (read u8 + prev), else absolute u32
+      bit 4 (0x10): length = compact u8, else full u32
+    [timestamp field]  either u8 delta or f32 absolute
+    [length field]     either u8 or u32
+    [packet_id field]  u16 or omitted (reuse prev)
+    [param field]      u8 delta or u32 absolute
+    [payload: length bytes]
 """
 
 from __future__ import annotations
@@ -50,12 +56,22 @@ class FrameHeader:
 
 @dataclass
 class ParsedPacket:
-    """Single game packet extracted from frame content."""
-    time_delta: int
-    channel: int
-    size: int
-    data: bytes
-    offset: int  # offset within content
+    """Single game block extracted from frame content."""
+    timestamp: float     # accumulated game time in seconds
+    packet_id: int       # u16 packet type ID
+    param: int           # u32 param (often netID or sender)
+    size: int            # payload length
+    data: bytes          # raw payload bytes
+    offset: int          # offset within content
+
+    # Legacy aliases for compatibility
+    @property
+    def time_delta(self) -> int:
+        return 0
+
+    @property
+    def channel(self) -> int:
+        return self.packet_id & 0xFF
 
 
 @dataclass
@@ -115,32 +131,110 @@ def _parse_header(data: bytes) -> FrameHeader:
 # ── Inner packet parsing ─────────────────────────────────────────────
 
 
-def _parse_packets_format_a(content: bytes) -> tuple[list[ParsedPacket], int, list[str]]:
+def _parse_blocks(content: bytes) -> tuple[list[ParsedPacket], int, list[str]]:
     """
-    [time_delta: u8][channel: u8][size: u16 LE][payload: N bytes]
+    Parse blocks using marker-byte format (from Mowokuma/ROFL).
+
+    marker byte bits:
+      0x80: timestamp is u8 delta (*0.001 + acc) vs f32 absolute
+      0x40: packet_id reuses previous vs read u16
+      0x20: param is u8 delta (+prev) vs u32 absolute
+      0x10: length is u8 vs u32
     """
     pkts: list[ParsedPacket] = []
     errors: list[str] = []
     pos = 0
+    acc_time = 0.0
+    prev_packet_id = 0
+    prev_param = 0
 
-    while pos + 4 <= len(content):
-        td = content[pos]
-        ch = content[pos + 1]
-        sz = struct.unpack_from("<H", content, pos + 2)[0]
-        hdr_end = pos + 4
+    while pos < len(content):
+        block_start = pos
 
-        if sz > len(content) - hdr_end:
-            errors.append(f"overflow sz={sz} at {pos}")
+        # Read marker byte
+        if pos >= len(content):
             break
+        marker = content[pos]
+        pos += 1
 
-        pkts.append(ParsedPacket(
-            time_delta=td,
-            channel=ch,
-            size=sz,
-            data=content[hdr_end:hdr_end + sz],
-            offset=pos,
-        ))
-        pos = hdr_end + sz
+        try:
+            # TIMESTAMP
+            if marker & 0x80:
+                if pos >= len(content):
+                    errors.append(f"truncated timestamp at {block_start}")
+                    break
+                delta = content[pos]
+                pos += 1
+                acc_time += delta * 0.001
+            else:
+                if pos + 4 > len(content):
+                    errors.append(f"truncated f32 timestamp at {block_start}")
+                    break
+                acc_time = struct.unpack_from("<f", content, pos)[0]
+                pos += 4
+
+            # LENGTH
+            if marker & 0x10:
+                if pos >= len(content):
+                    errors.append(f"truncated u8 length at {block_start}")
+                    break
+                length = content[pos]
+                pos += 1
+            else:
+                if pos + 4 > len(content):
+                    errors.append(f"truncated u32 length at {block_start}")
+                    break
+                length = struct.unpack_from("<I", content, pos)[0]
+                pos += 4
+
+            # PACKET ID
+            if marker & 0x40:
+                packet_id = prev_packet_id
+            else:
+                if pos + 2 > len(content):
+                    errors.append(f"truncated packet_id at {block_start}")
+                    break
+                packet_id = struct.unpack_from("<H", content, pos)[0]
+                pos += 2
+
+            # PARAM
+            if marker & 0x20:
+                if pos >= len(content):
+                    errors.append(f"truncated u8 param at {block_start}")
+                    break
+                param_delta = content[pos]
+                pos += 1
+                param = param_delta + prev_param
+            else:
+                if pos + 4 > len(content):
+                    errors.append(f"truncated u32 param at {block_start}")
+                    break
+                param = struct.unpack_from("<I", content, pos)[0]
+                pos += 4
+
+            # PAYLOAD
+            if pos + length > len(content):
+                errors.append(f"payload overflow: need {length}B at {pos}, have {len(content)-pos}")
+                break
+
+            payload = content[pos:pos + length]
+            pos += length
+
+            prev_packet_id = packet_id
+            prev_param = param
+
+            pkts.append(ParsedPacket(
+                timestamp=acc_time,
+                packet_id=packet_id,
+                param=param,
+                size=length,
+                data=payload,
+                offset=block_start,
+            ))
+
+        except Exception as e:
+            errors.append(f"error at {block_start}: {e}")
+            break
 
     return pkts, pos, errors
 
@@ -154,13 +248,12 @@ def parse_payload_frames(frames: list[bytes],
     result: list[FrameInfo] = []
 
     for i, raw in enumerate(frames):
+        # Frame header is derived from the block content (first block's timestamp)
         header = _parse_header(raw)
 
-        # Strip 15B header if type is valid (1 or 2)
-        if header.frame_type in (1, 2) and len(raw) > HEADER_SIZE:
-            content = raw[HEADER_SIZE:]
-        else:
-            content = raw
+        # Block parser operates on the FULL decompressed frame data
+        # (the first bytes are blocks, not a separate header)
+        content = raw
 
         info = FrameInfo(
             index=i,
@@ -170,7 +263,7 @@ def parse_payload_frames(frames: list[bytes],
         )
 
         if parse_packets and len(content) > 4:
-            pkts, consumed, errs = _parse_packets_format_a(content)
+            pkts, consumed, errs = _parse_blocks(content)
             info.packets = pkts
             info.pkt_bytes_consumed = consumed
             info.pkt_errors = errs
