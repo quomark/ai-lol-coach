@@ -14,73 +14,14 @@
 | Cipher extraction tool | Working | `ml/tools/extract_ciphers.py` |
 | Runtime dump script (Win) | Created, untested | `ml/emulator/dump_runtime.py` |
 
-### What's BROKEN: Position Coordinates
-**This is the #1 blocker.** Movement packets decode with 0 leftover (structure is correct), but the x,z coordinates are WRONG:
-- At t=0, all 10 champions show identical positions (should be at fountain)
-- Blue and red team members appear at same coordinates
-- X values roughly scale to Maknee's range, but Z is completely off
-- **Root cause**: The binary dump (`ml/data/league_unpacked_patched.bin`) was captured via `CREATE_SUSPENDED` — the game hadn't initialized yet, so LUT tables and cipher constants may contain pre-init values
-
-### Coordinate System Reference (from Maknee's decoded data)
-- Grid coordinates centered at (0,0), range ±7300
-- Values are even numbers (grid × 2)
-- Blue fountain: (-6754, -6800), Red fountain: (6710, 6688)
-- Our decoder outputs unsigned 14-bit values (0-16383): `x = f10 & 0x3FFF, z = (f10 >> 14) & 0x3FFF`
-
-### Binary Dump Problem
-- Current dump: `ml/data/league_unpacked_patched.bin` (33MB)
-- Method: `CREATE_SUSPENDED` → DllMain runs (unpacks code) → dump before entry point
-- Problem: LUT at RVA `0x19B60F0` and other cipher tables may not be populated until runtime init
-- Need: A **runtime dump** after the game has fully initialized
-
-## Next Step: macOS Runtime Dump
-
-macOS is the best path because:
-1. Vanguard on macOS is **user-mode only** (no kernel driver blocking memory reads)
-2. Can freely attach `lldb` to running League process
-3. Cipher tables / LUT values are **identical** across platforms (same server protocol)
-4. Only the RVAs (offsets in the binary) differ between Windows PE and macOS Mach-O
-
-### macOS Dump Procedure
-
-```bash
-# 1. Install League on Mac, open a replay
-#    Double-click a .rofl file or: open -a "League of Legends" replay.rofl
-
-# 2. Wait for game to load (10-15 seconds after you see the game)
-
-# 3. Find the process
-ps aux | grep -i league
-# or
-pgrep -f LeagueofLegends
-
-# 4. Attach lldb
-lldb -p <PID>
-
-# 5. In lldb, find the main module
-(lldb) image list
-# Look for LeagueofLegends — note the base address and size
-
-# 6. Dump the entire binary
-(lldb) memory read --outfile ~/league_macos_dump.bin --binary --force --count <SIZE> <BASE_ADDR>
-
-# 7. Detach
-(lldb) detach
-```
-
-### After Getting the macOS Dump
-
-The LUT and cipher constants need to be found at macOS-specific offsets. Run the scanning script:
-
-```bash
-python ml/tools/scan_macos_dump.py ~/league_macos_dump.bin
-```
-
-This will:
-1. Find 256-byte permutation tables (LUTs) — each byte appears exactly once
-2. Find cipher constant patterns matching known Windows values
-3. Extract the actual initialized values
-4. Validate by decoding packets with the new values
+### Position Coordinates: FIXED (2026-03-14)
+**Previously the #1 blocker — now resolved.**
+- macOS runtime dump captured via `ml/tools/macos_dump.py` (Mach VM APIs, no lldb needed)
+- LUT extracted from runtime dump: 256-byte permutation table at offset 0x1EF5228
+- Same LUT works for both 0x025B and 0x0228 decoders
+- LUT is now embedded directly in code — no binary dump file dependency
+- Positions verified: 10 champions show distinct positions, blue/red team separation works
+- Coordinate system: unsigned 14-bit (0-16383), mapping to LoL map (~15000x15000 units)
 
 ## Key RVAs (Windows Binary — for reference)
 
@@ -139,12 +80,22 @@ This will:
 - `ml/tools/extract_ciphers.py` — Auto-extract cipher params from binary dumps
 
 ### Dump Tools
+- `ml/tools/macos_dump.py` — macOS runtime dump via Mach VM APIs (working, used to extract LUT)
+- `ml/tools/scan_macos_dump.py` — Scan binary dumps for LUT/cipher tables
 - `ml/emulator/dump_via_suspended.py` — CREATE_SUSPENDED dump (Windows)
 - `ml/emulator/dump_runtime.py` — Runtime dump (Windows, needs Vanguard bypass)
 
 ### Binary Data
-- `ml/data/league_unpacked_patched.bin` — 33MB Windows binary dump (CREATE_SUSPENDED, possibly uninitialized LUTs)
+- `ml/data/macos_lut.bin` — 256-byte LUT extracted from macOS runtime dump (the key cipher table)
+- `ml/data/league_macos_dump.bin` — 161MB macOS runtime dump (gitignored, not needed — LUT is embedded in code)
 
 ### Research/Analysis Scripts (in ml/emulator/)
 Many analysis scripts were created during reverse engineering. Most are one-off experiments.
 Key ones: `find_all_deserializers.py`, `find_decrypt_rvas.py`, `unicorn_emulator.py`
+
+## Next Steps
+
+1. **Fix death detection overcount** — currently ~2x (102 detected vs ~47 actual). Need better heuristics for f8 drop detection.
+2. **Improve coaching analyzer** — currently draft. With working positions + state data, can now generate real insights (CS/min, positioning, death timing, etc.)
+3. **Build user-facing pipeline** — end-to-end: upload .rofl → parse → analyze → show coaching feedback
+4. **Test with more replays** — verify decoder works across different patches and game modes

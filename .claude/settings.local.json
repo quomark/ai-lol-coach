@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mdfind \"kMDItemDisplayName == ''''*League*''''\")",
+      "Bash(echo:*)",
+      "Bash(csrutil status:*)",
+      "Bash(codesign:*)",
+      "Bash(DevToolsSecurity -status 2>&1)",
+      "Bash(sudo lldb:*)",
+      "Bash(vmmap:*)",
+      "Bash(python3:*)",
+      "Bash(pip3 install:*)",
+      "Bash(grep:*)",
+      "Bash(open:*)",
+      "Bash(python:*)",
+      "Bash(pip list:*)"
+    ]
+  }
+}

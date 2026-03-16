@@ -140,9 +140,9 @@ CHAMPION_PARAM_RANGE = range(0x400000A0, 0x400000C0)
 class GameStateBuilder:
     """Build game state from ROFL replay using decoded packets."""
 
-    def __init__(self, binary_path: str | Path):
-        self._mov_decoder = MovementDecoder(binary_path)
-        self._state_decoder = Decoder0228(binary_path)
+    def __init__(self):
+        self._mov_decoder = MovementDecoder()
+        self._state_decoder = Decoder0228()
 
     def build_from_rofl(self, rofl_path: str | Path) -> GameState:
         """Parse a ROFL file and reconstruct game state."""

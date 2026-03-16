@@ -9,6 +9,8 @@ build/
 .venv/
 node_modules/
 .next/
+ml/data/
 ml/data/raw/
 ml/data/processed/
 ml/models/
+ml/tools/
